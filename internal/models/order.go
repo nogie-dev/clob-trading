@@ -12,8 +12,8 @@ const (
 	Limit  OrderType = "LIMIT"
 	Market OrderType = "MARKET"
 
-	Buy  Position = "BID"
-	Sell Position = "ASK"
+	Bid Position = "BID"
+	Ask Position = "ASK"
 
 	Pending  OrderStatus = "PENDING"  // 매칭 대기
 	Filled   OrderStatus = "FILLED"   // 전체 체결
@@ -40,10 +40,4 @@ type RequestOrder struct {
 	Position  Position  `json:"position"`
 	Price     float64   `json:"price"`
 	Amount    float64   `json:"amount"`
-}
-
-type OrderBook struct {
-	Bids   map[float64][]*MakerOrder
-	Asks   map[float64][]*MakerOrder
-	Ticker string
 }
