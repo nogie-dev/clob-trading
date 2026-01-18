@@ -80,6 +80,22 @@ var SampleOrders = []models.RequestOrder{
 	},
 	{
 		Ticker:    "BTC-USD",
+		UserID:    "heidi",
+		OrderType: models.Limit,
+		Position:  models.Ask,
+		Price:     96538.5,
+		Amount:    1.02,
+	},
+	{
+		Ticker:    "BTC-USD",
+		UserID:    "heidi",
+		OrderType: models.Limit,
+		Position:  models.Ask,
+		Price:     96538.5,
+		Amount:    4.02,
+	},
+	{
+		Ticker:    "BTC-USD",
 		UserID:    "ivan",
 		OrderType: models.Limit,
 		Position:  models.Ask,

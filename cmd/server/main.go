@@ -13,4 +13,5 @@ func main() {
 		order := engine.CreateOrder(req)
 		orderbook.AddOrder(&order)
 	}
+	orderbook.PrintOrderBook()
 }
