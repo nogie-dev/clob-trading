@@ -28,8 +28,8 @@ func NewOrderBook(ticker string) *OrderBook {
 }
 
 func CreateOrder(req models.RequestOrder) models.MakerOrder {
-	order := models.MakerOrder{
-		// OrderID:   generateID()
+	return models.MakerOrder{
+		// OrderID: generateID(),
 		Ticker:    req.Ticker,
 		UserID:    req.UserID,
 		OrderType: req.OrderType,
@@ -39,41 +39,30 @@ func CreateOrder(req models.RequestOrder) models.MakerOrder {
 		Status:    models.Pending,
 		Timestamp: time.Now(),
 	}
-	return order
 }
 
-func (ob *OrderBook) ProcessingOrder(order *models.MakerOrder) {
+func (ob *OrderBook) AddOrder(order *models.MakerOrder) {
+	var levels map[float64]*util.PriceLevel
+	var h heap.Interface
 	switch order.Position {
 	case models.Bid:
-		ob.addBid(order)
+		levels, h = ob.Bids, &ob.bidLevels
 	case models.Ask:
-		ob.addAsk(order)
+		levels, h = ob.Asks, &ob.askLevels
 	default:
+		return
 	}
-}
 
-func (ob *OrderBook) addBid(order *models.MakerOrder) {
-	lvl, ok := ob.Bids[order.Price]
+	lvl, ok := levels[order.Price]
 	if !ok {
-		lvl = &util.PriceLevel{
-			Price: order.Price,
-			Queue: util.NewQueue(),
-		}
-		ob.Bids[order.Price] = lvl
-		heap.Push(&ob.bidLevels, lvl)
+		lvl = &util.PriceLevel{Price: order.Price, Queue: util.NewQueue()}
+		levels[order.Price] = lvl
+		heap.Push(h, lvl)
 	}
+	lvl.TotalAmount += order.Amount
 	lvl.Queue.Push(order)
 }
 
-func (ob *OrderBook) addAsk(order *models.MakerOrder) {
-	lvl, ok := ob.Asks[order.Price]
-	if !ok {
-		lvl = &util.PriceLevel{
-			Price: order.Price,
-			Queue: util.NewQueue(),
-		}
-		ob.Asks[order.Price] = lvl
-		heap.Push(&ob.bidLevels, lvl)
-	}
-	lvl.Queue.Push(order)
+func (ob *OrderBook) PrintOrderBook() {
+
 }

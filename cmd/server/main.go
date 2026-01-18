@@ -11,6 +11,6 @@ func main() {
 
 	for _, req := range testdata.SampleOrders {
 		order := engine.CreateOrder(req)
-		orderbook.ProcessingOrder(&order)
+		orderbook.AddOrder(&order)
 	}
 }
