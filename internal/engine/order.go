@@ -1,25 +1,30 @@
 package engine
 
 import (
-	"fmt"
-	"sort"
+	"container/heap"
 	"time"
 
 	"github.com/nogie-dev/clob-trading/internal/models"
+	"github.com/nogie-dev/clob-trading/internal/util"
 )
 
 type OrderBook struct {
-	Bids   map[float64][]*models.MakerOrder
-	Asks   map[float64][]*models.MakerOrder
-	Ticker string
+	Bids      map[float64]*util.PriceLevel
+	Asks      map[float64]*util.PriceLevel
+	bidLevels util.MaxPriceHeap
+	askLevels util.MinPriceHeap
+	Ticker    string
 }
 
 func NewOrderBook(ticker string) *OrderBook {
-	return &OrderBook{
+	ob := &OrderBook{
 		Ticker: ticker,
-		Bids:   make(map[float64][]*models.MakerOrder),
-		Asks:   make(map[float64][]*models.MakerOrder),
+		Bids:   make(map[float64]*util.PriceLevel),
+		Asks:   make(map[float64]*util.PriceLevel),
 	}
+	heap.Init(&ob.bidLevels)
+	heap.Init(&ob.askLevels)
+	return ob
 }
 
 func CreateOrder(req models.RequestOrder) models.MakerOrder {
@@ -37,28 +42,38 @@ func CreateOrder(req models.RequestOrder) models.MakerOrder {
 	return order
 }
 
-func (orderbook *OrderBook) PrintOrderBook() {
-	fmt.Printf("=== OrderBook %s ===\n", orderbook.Ticker)
+func (ob *OrderBook) ProcessingOrder(order *models.MakerOrder) {
+	switch order.Position {
+	case models.Bid:
+		ob.addBid(order)
+	case models.Ask:
+		ob.addAsk(order)
+	default:
+	}
+}
 
-	bidPrices := make([]float64, 0, len(orderbook.Bids))
-	for p := range orderbook.Bids {
-		bidPrices = append(bidPrices, p)
-	}
-	sort.Sort(sort.Reverse(sort.Float64Slice(bidPrices)))
-	for _, p := range bidPrices {
-		for _, o := range orderbook.Bids[p] {
-			fmt.Printf("[BID] price=%.4f amount=%.4f id=%s\n", o.Price, o.Amount, o.OrderID)
+func (ob *OrderBook) addBid(order *models.MakerOrder) {
+	lvl, ok := ob.Bids[order.Price]
+	if !ok {
+		lvl = &util.PriceLevel{
+			Price: order.Price,
+			Queue: util.NewQueue(),
 		}
+		ob.Bids[order.Price] = lvl
+		heap.Push(&ob.bidLevels, lvl)
 	}
+	lvl.Queue.Push(order)
+}
 
-	askPrices := make([]float64, 0, len(orderbook.Asks))
-	for p := range orderbook.Asks {
-		askPrices = append(askPrices, p)
-	}
-	sort.Float64s(askPrices)
-	for _, p := range askPrices {
-		for _, o := range orderbook.Asks[p] {
-			fmt.Printf("[ASK] price=%.4f amount=%.4f id=%s\n", o.Price, o.Amount, o.OrderID)
+func (ob *OrderBook) addAsk(order *models.MakerOrder) {
+	lvl, ok := ob.Asks[order.Price]
+	if !ok {
+		lvl = &util.PriceLevel{
+			Price: order.Price,
+			Queue: util.NewQueue(),
 		}
+		ob.Asks[order.Price] = lvl
+		heap.Push(&ob.bidLevels, lvl)
 	}
+	lvl.Queue.Push(order)
 }

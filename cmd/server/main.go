@@ -6,13 +6,11 @@ import (
 )
 
 func main() {
-	matcher := engine.NewMatcher()
+	// matcher := engine.NewMatcher()
 	orderbook := engine.NewOrderBook("BTC-USD")
 
 	for _, req := range testdata.SampleOrders {
 		order := engine.CreateOrder(req)
-		matcher.ProcessingOrder(orderbook, order)
+		orderbook.ProcessingOrder(&order)
 	}
-
-	orderbook.PrintOrderBook()
 }
