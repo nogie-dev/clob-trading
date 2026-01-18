@@ -73,6 +73,7 @@ func (ob *OrderBook) PrintOrderBook() {
 	}
 
 	askHeap := append(util.MinPriceHeap(nil), ob.askLevels...)
+	heap.Init(&askHeap)
 	for askHeap.Len() > 0 {
 		lvl := heap.Pop(&askHeap).(*util.PriceLevel)
 		fmt.Printf("ASK price=%.4f total=%.4f\n", lvl.Price, lvl.TotalAmount)
