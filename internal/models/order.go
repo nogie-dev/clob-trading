@@ -31,6 +31,7 @@ type MakerOrder struct {
 	Amount    float64     `json:"amount"`     // 수량
 	Timestamp time.Time   `json:"timestamp"`  // 주문 생성 시간
 	Status    OrderStatus `json:"status"`     // 현재 주문 상태
+	Nonce     uint64      `json:"nonce"`
 }
 
 type RequestOrder struct {
@@ -40,4 +41,5 @@ type RequestOrder struct {
 	Position  Position  `json:"position"`
 	Price     float64   `json:"price"`
 	Amount    float64   `json:"amount"`
+	Nonce     uint64    `json:"nonce"`
 }

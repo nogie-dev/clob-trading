@@ -30,7 +30,7 @@ func NewOrderBook(ticker string) *OrderBook {
 
 func CreateOrder(req models.RequestOrder) models.MakerOrder {
 	return models.MakerOrder{
-		// OrderID: generateID(),
+		OrderID:   util.GenerateOrderID(req),
 		Ticker:    req.Ticker,
 		UserID:    req.UserID,
 		OrderType: req.OrderType,
@@ -39,6 +39,7 @@ func CreateOrder(req models.RequestOrder) models.MakerOrder {
 		Amount:    req.Amount,
 		Status:    models.Pending,
 		Timestamp: time.Now(),
+		Nonce:     req.Nonce,
 	}
 }
 
