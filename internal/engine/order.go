@@ -2,6 +2,7 @@ package engine
 
 import (
 	"container/heap"
+	"container/list"
 	"fmt"
 	"time"
 
@@ -14,6 +15,7 @@ type OrderBook struct {
 	Asks      map[float64]*util.PriceLevel
 	bidLevels util.MaxPriceHeap
 	askLevels util.MinPriceHeap
+	Index     map[string]*list.Element
 	Ticker    string
 }
 
@@ -22,6 +24,7 @@ func NewOrderBook(ticker string) *OrderBook {
 		Ticker: ticker,
 		Bids:   make(map[float64]*util.PriceLevel),
 		Asks:   make(map[float64]*util.PriceLevel),
+		Index:  make(map[string]*list.Element),
 	}
 	heap.Init(&ob.bidLevels)
 	heap.Init(&ob.askLevels)
@@ -56,13 +59,14 @@ func (ob *OrderBook) AddOrder(order *models.MakerOrder) {
 	}
 
 	lvl, ok := levels[order.Price]
+	// 해당 호가에 존재하지 않으면
 	if !ok {
 		lvl = &util.PriceLevel{Price: order.Price, Queue: util.NewQueue()}
 		levels[order.Price] = lvl
 		heap.Push(h, lvl)
 	}
 	lvl.TotalAmount += order.Amount
-	lvl.Queue.Push(order)
+	ob.Index[order.OrderID] = lvl.Queue.Push(order)
 }
 
 func (ob *OrderBook) PrintOrderBook() {
