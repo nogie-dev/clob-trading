@@ -21,6 +21,8 @@ import (
 	"github.com/nogie-dev/clob-trading/internal/engine"
 	"github.com/nogie-dev/clob-trading/internal/journal"
 	journalpostgres "github.com/nogie-dev/clob-trading/internal/journal/postgres"
+	"github.com/nogie-dev/clob-trading/internal/market"
+	marketpostgres "github.com/nogie-dev/clob-trading/internal/market/postgres"
 	"github.com/nogie-dev/clob-trading/internal/matchlog"
 	matchlogpostgres "github.com/nogie-dev/clob-trading/internal/matchlog/postgres"
 )
@@ -32,6 +34,7 @@ type engineRuntime struct {
 	persistenceOut        chan matchlog.PersistenceRequest
 	writerDone            chan struct{}
 	journalStore          journal.Store
+	marketStore           market.Store
 	workerInputBufferSize int
 	lifecycleMu           sync.Mutex
 }
@@ -80,6 +83,7 @@ func serve(cfg config.Config, address, databaseURL string) error {
 		cfg,
 		matchlogpostgres.NewStore(pool),
 		journalpostgres.NewStore(pool),
+		marketpostgres.NewStore(pool),
 	)
 	if err != nil {
 		return err
@@ -121,12 +125,15 @@ func serve(cfg config.Config, address, databaseURL string) error {
 	return errors.Join(httpShutdownErr, engineShutdownErr, listenErr)
 }
 
-func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Store, journalStore journal.Store) (*engineRuntime, error) {
+func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Store, journalStore journal.Store, marketStore market.Store) (*engineRuntime, error) {
 	if matchStore == nil {
 		return nil, matchlog.ErrStoreUnavailable
 	}
 	if journalStore == nil {
 		return nil, journal.ErrStoreUnavailable
+	}
+	if marketStore == nil {
+		return nil, market.ErrStoreUnavailable
 	}
 	persistenceOut := make(chan matchlog.PersistenceRequest, cfg.Engine.MatchLogOutputBufferSize)
 	writerDone := make(chan struct{})
@@ -142,7 +149,14 @@ func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Sto
 		persistenceOut:        persistenceOut,
 		writerDone:            writerDone,
 		journalStore:          journalStore,
+		marketStore:           marketStore,
 		workerInputBufferSize: cfg.Engine.WorkerInputBufferSize,
+	}
+	markets, err := marketStore.List(ctx)
+	if err != nil {
+		close(persistenceOut)
+		<-writerDone
+		return nil, fmt.Errorf("load markets: %w", err)
 	}
 	commands, err := journalStore.List(ctx)
 	if err != nil {
@@ -151,9 +165,19 @@ func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Sto
 		return nil, fmt.Errorf("load order journal: %w", err)
 	}
 	commandsByTicker := make(map[string][]journal.Command)
-	tickers := map[string]struct{}{"BTC-USD": {}}
+	tickers := make(map[string]struct{}, len(markets)+len(commands))
+	for _, registered := range markets {
+		tickers[registered.Ticker] = struct{}{}
+	}
 	for _, command := range commands {
 		commandsByTicker[command.Ticker] = append(commandsByTicker[command.Ticker], command)
+		if _, registered := tickers[command.Ticker]; !registered {
+			if _, err := marketStore.Add(ctx, command.Ticker); err != nil {
+				close(persistenceOut)
+				<-writerDone
+				return nil, fmt.Errorf("persist journal ticker %q: %w", command.Ticker, err)
+			}
+		}
 		tickers[command.Ticker] = struct{}{}
 	}
 	tickerNames := make([]string, 0, len(tickers))
@@ -185,6 +209,9 @@ func (r *engineRuntime) AddTicker(ctx context.Context, ticker string) error {
 	}
 	if r.router.HasTicker(ticker) {
 		return fmt.Errorf("%w: %s", engine.ErrTickerExists, ticker)
+	}
+	if _, err := r.marketStore.Add(ctx, ticker); err != nil {
+		return fmt.Errorf("persist ticker %q: %w", ticker, err)
 	}
 
 	commands, err := r.journalStore.List(ctx)

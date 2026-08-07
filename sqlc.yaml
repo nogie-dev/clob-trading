@@ -22,3 +22,13 @@ sql:
         sql_package: "pgx/v5"
         emit_json_tags: true
         emit_db_tags: true
+  - engine: "postgresql"
+    schema: "db/migrations/00004_create_markets.sql"
+    queries: "db/query/markets.sql"
+    gen:
+      go:
+        package: "db"
+        out: "internal/market/postgres/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_db_tags: true

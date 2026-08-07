@@ -10,6 +10,7 @@ import (
 	"github.com/nogie-dev/clob-trading/internal/config"
 	"github.com/nogie-dev/clob-trading/internal/engine"
 	"github.com/nogie-dev/clob-trading/internal/journal"
+	"github.com/nogie-dev/clob-trading/internal/market"
 	"github.com/nogie-dev/clob-trading/internal/matchlog"
 	"github.com/nogie-dev/clob-trading/internal/models"
 )
@@ -50,6 +51,46 @@ func (s *idempotentStore) SaveMatchLogs(_ context.Context, logs []matchlog.Match
 type memoryJournal struct {
 	commands []journal.Command
 	err      error
+}
+
+type memoryMarketStore struct {
+	markets map[string]market.Market
+	err     error
+}
+
+func newMemoryMarketStore(tickers ...string) *memoryMarketStore {
+	store := &memoryMarketStore{markets: make(map[string]market.Market)}
+	for _, ticker := range tickers {
+		store.markets[ticker] = market.Market{Ticker: ticker, CreatedAt: time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)}
+	}
+	return store
+}
+
+func (m *memoryMarketStore) Add(_ context.Context, ticker string) (market.AddResult, error) {
+	if m.err != nil {
+		return market.AddResult{}, m.err
+	}
+	normalized, err := market.NormalizeTicker(ticker)
+	if err != nil {
+		return market.AddResult{}, err
+	}
+	if existing, ok := m.markets[normalized]; ok {
+		return market.AddResult{Market: existing, Inserted: false}, nil
+	}
+	created := market.Market{Ticker: normalized, CreatedAt: time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)}
+	m.markets[normalized] = created
+	return market.AddResult{Market: created, Inserted: true}, nil
+}
+
+func (m *memoryMarketStore) List(_ context.Context) ([]market.Market, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	markets := make([]market.Market, 0, len(m.markets))
+	for _, item := range m.markets {
+		markets = append(markets, item)
+	}
+	return markets, nil
 }
 
 func (m *memoryJournal) Append(_ context.Context, command journal.Command) (journal.AppendResult, error) {
@@ -119,6 +160,7 @@ func TestStartEngineFailsBeforeServingWhenJournalLoadFails(t *testing.T) {
 		config.Default(),
 		newIdempotentStore(),
 		&memoryJournal{err: journalErr},
+		newMemoryMarketStore("BTC-USD"),
 	)
 	if !errors.Is(err, journalErr) {
 		t.Fatalf("startEngine want journal load error, got %v", err)
@@ -127,7 +169,7 @@ func TestStartEngineFailsBeforeServingWhenJournalLoadFails(t *testing.T) {
 
 func TestEngineRuntimePersistsMatchBeforeShutdown(t *testing.T) {
 	store := &recordingStore{}
-	runtime, err := startEngine(context.Background(), config.Default(), store, &memoryJournal{})
+	runtime, err := startEngine(context.Background(), config.Default(), store, &memoryJournal{}, newMemoryMarketStore("BTC-USD"))
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
@@ -180,7 +222,7 @@ func TestEngineRuntimePersistsMatchBeforeShutdown(t *testing.T) {
 
 func TestEngineRuntimeHaltsOnStoreFailure(t *testing.T) {
 	storeErr := errors.New("database unavailable")
-	runtime, err := startEngine(context.Background(), config.Default(), &recordingStore{err: storeErr}, &memoryJournal{})
+	runtime, err := startEngine(context.Background(), config.Default(), &recordingStore{err: storeErr}, &memoryJournal{}, newMemoryMarketStore("BTC-USD"))
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
@@ -236,7 +278,7 @@ func TestStartEngineReplaysJournalAndReconcilesMatchLogs(t *testing.T) {
 	matchStore := newIdempotentStore()
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore)
+		runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, newMemoryMarketStore("BTC-USD"))
 		if err != nil {
 			t.Fatalf("startEngine replay attempt %d: %v", attempt, err)
 		}
@@ -258,7 +300,7 @@ func TestStartEngineReplaysJournalAndReconcilesMatchLogs(t *testing.T) {
 func TestRestartRecoversJournaledCommandAfterMatchLogFailure(t *testing.T) {
 	journalStore := &memoryJournal{}
 	matchStore := newIdempotentStore()
-	runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore)
+	runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, newMemoryMarketStore("BTC-USD"))
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
@@ -280,7 +322,7 @@ func TestRestartRecoversJournaledCommandAfterMatchLogFailure(t *testing.T) {
 	cancel()
 
 	matchStore.err = nil
-	recovered, err := startEngine(context.Background(), config.Default(), matchStore, journalStore)
+	recovered, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, newMemoryMarketStore("BTC-USD"))
 	if err != nil {
 		t.Fatalf("restart replay returned error: %v", err)
 	}
@@ -295,7 +337,7 @@ func TestRestartRecoversJournaledCommandAfterMatchLogFailure(t *testing.T) {
 }
 
 func TestEngineRuntimeDoesNotApplyDuplicateCommandTwice(t *testing.T) {
-	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), &memoryJournal{})
+	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), &memoryJournal{}, newMemoryMarketStore("BTC-USD"))
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
@@ -323,13 +365,19 @@ func TestEngineRuntimeDoesNotApplyDuplicateCommandTwice(t *testing.T) {
 }
 
 func TestEngineRuntimeAddsTickerAndRoutesCommands(t *testing.T) {
-	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), &memoryJournal{})
+	matchStore := newIdempotentStore()
+	journalStore := &memoryJournal{}
+	marketStore := newMemoryMarketStore("BTC-USD")
+	runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, marketStore)
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
 
 	if err := runtime.AddTicker(context.Background(), " ETH-USD "); err != nil {
 		t.Fatalf("AddTicker returned error: %v", err)
+	}
+	if _, ok := marketStore.markets["ETH-USD"]; !ok {
+		t.Fatal("AddTicker did not persist ETH-USD in the market store")
 	}
 	if err := runtime.AddTicker(context.Background(), "ETH-USD"); !errors.Is(err, engine.ErrTickerExists) {
 		t.Fatalf("duplicate AddTicker want ErrTickerExists, got %v", err)
@@ -355,6 +403,23 @@ func TestEngineRuntimeAddsTickerAndRoutesCommands(t *testing.T) {
 	if err := runtime.shutdown(ctx); err != nil {
 		t.Fatalf("runtime shutdown: %v", err)
 	}
+
+	recovered, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, marketStore)
+	if err != nil {
+		t.Fatalf("restart after ticker registration returned error: %v", err)
+	}
+	snapshot, err = recovered.router.OrderBookSnapshot("ETH-USD", 1)
+	if err != nil {
+		t.Fatalf("restored ETH snapshot returned error: %v", err)
+	}
+	if len(snapshot.Bids) != 1 || snapshot.Bids[0].Price != 2000 || snapshot.Bids[0].Amount != 1 {
+		t.Fatalf("unexpected restored ETH snapshot: %#v", snapshot)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := recovered.shutdown(ctx); err != nil {
+		t.Fatalf("recovered runtime shutdown: %v", err)
+	}
 }
 
 func TestStartEngineRestoresJournaledTickers(t *testing.T) {
@@ -375,7 +440,7 @@ func TestStartEngineRestoresJournaledTickers(t *testing.T) {
 		}
 	}
 
-	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), journalStore)
+	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), journalStore, newMemoryMarketStore("BTC-USD"))
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
