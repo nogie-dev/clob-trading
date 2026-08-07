@@ -321,3 +321,77 @@ func TestEngineRuntimeDoesNotApplyDuplicateCommandTwice(t *testing.T) {
 		t.Fatalf("runtime shutdown: %v", err)
 	}
 }
+
+func TestEngineRuntimeAddsTickerAndRoutesCommands(t *testing.T) {
+	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), &memoryJournal{})
+	if err != nil {
+		t.Fatalf("startEngine returned error: %v", err)
+	}
+
+	if err := runtime.AddTicker(context.Background(), " ETH-USD "); err != nil {
+		t.Fatalf("AddTicker returned error: %v", err)
+	}
+	if err := runtime.AddTicker(context.Background(), "ETH-USD"); !errors.Is(err, engine.ErrTickerExists) {
+		t.Fatalf("duplicate AddTicker want ErrTickerExists, got %v", err)
+	}
+
+	order := models.CreateOrderRequest{
+		CommandID: "eth-command", Ticker: "ETH-USD", UserID: "alice",
+		OrderType: models.Limit, Position: models.Bid, Price: 2000, Amount: 1, Nonce: 1,
+	}
+	if err := runtime.router.OrderRouter(engine.Event{Type: engine.NewOrder, Ticker: order.Ticker, NewOrder: &order}); err != nil {
+		t.Fatalf("route ETH order: %v", err)
+	}
+	snapshot, err := runtime.router.OrderBookSnapshot("ETH-USD", 1)
+	if err != nil {
+		t.Fatalf("ETH snapshot returned error: %v", err)
+	}
+	if len(snapshot.Bids) != 1 || snapshot.Bids[0].Price != 2000 || snapshot.Bids[0].Amount != 1 {
+		t.Fatalf("unexpected ETH snapshot: %#v", snapshot)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := runtime.shutdown(ctx); err != nil {
+		t.Fatalf("runtime shutdown: %v", err)
+	}
+}
+
+func TestStartEngineRestoresJournaledTickers(t *testing.T) {
+	journalStore := &memoryJournal{}
+	commands := []journal.Command{
+		{
+			CommandID: "btc-command", Ticker: "BTC-USD", Type: journal.CreateCommand,
+			Create: &models.CreateOrderRequest{CommandID: "btc-command", Ticker: "BTC-USD", UserID: "btc-user", OrderType: models.Limit, Position: models.Bid, Price: 100, Amount: 1, Nonce: 1},
+		},
+		{
+			CommandID: "eth-command", Ticker: "ETH-USD", Type: journal.CreateCommand,
+			Create: &models.CreateOrderRequest{CommandID: "eth-command", Ticker: "ETH-USD", UserID: "eth-user", OrderType: models.Limit, Position: models.Ask, Price: 2000, Amount: 2, Nonce: 1},
+		},
+	}
+	for _, command := range commands {
+		if _, err := journalStore.Append(context.Background(), command); err != nil {
+			t.Fatalf("append journal command: %v", err)
+		}
+	}
+
+	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), journalStore)
+	if err != nil {
+		t.Fatalf("startEngine returned error: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := runtime.shutdown(ctx); err != nil {
+			t.Fatalf("runtime shutdown: %v", err)
+		}
+	}()
+
+	snapshot, err := runtime.router.OrderBookSnapshot("ETH-USD", 1)
+	if err != nil {
+		t.Fatalf("ETH snapshot returned error: %v", err)
+	}
+	if len(snapshot.Asks) != 1 || snapshot.Asks[0].Price != 2000 || snapshot.Asks[0].Amount != 2 {
+		t.Fatalf("unexpected restored ETH snapshot: %#v", snapshot)
+	}
+}

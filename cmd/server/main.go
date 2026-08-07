@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,9 +28,12 @@ import (
 const databaseURLEnv = "MATCHING_ENGINE_DATABASE_URL"
 
 type engineRuntime struct {
-	router         *engine.Router
-	persistenceOut chan matchlog.PersistenceRequest
-	writerDone     chan struct{}
+	router                *engine.Router
+	persistenceOut        chan matchlog.PersistenceRequest
+	writerDone            chan struct{}
+	journalStore          journal.Store
+	workerInputBufferSize int
+	lifecycleMu           sync.Mutex
 }
 
 func main() {
@@ -82,7 +87,7 @@ func serve(cfg config.Config, address, databaseURL string) error {
 
 	server := &http.Server{
 		Addr:              address,
-		Handler:           api.NewHandler(runtime.router),
+		Handler:           api.NewHandlerWithTickerAdder(runtime.router, runtime),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	serverErr := make(chan error, 1)
@@ -132,44 +137,91 @@ func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Sto
 	}()
 
 	router := engine.NewRouter()
-	worker := engine.NewBookWorkerWithOptions("BTC-USD", nil, engine.BookWorkerOptions{
-		InputBufferSize: cfg.Engine.WorkerInputBufferSize,
-		PersistenceOut:  persistenceOut,
-		Journal:         journalStore,
-	})
+	runtime := &engineRuntime{
+		router:                router,
+		persistenceOut:        persistenceOut,
+		writerDone:            writerDone,
+		journalStore:          journalStore,
+		workerInputBufferSize: cfg.Engine.WorkerInputBufferSize,
+	}
 	commands, err := journalStore.List(ctx)
 	if err != nil {
 		close(persistenceOut)
 		<-writerDone
 		return nil, fmt.Errorf("load order journal: %w", err)
 	}
+	commandsByTicker := make(map[string][]journal.Command)
+	tickers := map[string]struct{}{"BTC-USD": {}}
 	for _, command := range commands {
-		if command.Ticker != "BTC-USD" {
+		commandsByTicker[command.Ticker] = append(commandsByTicker[command.Ticker], command)
+		tickers[command.Ticker] = struct{}{}
+	}
+	tickerNames := make([]string, 0, len(tickers))
+	for ticker := range tickers {
+		tickerNames = append(tickerNames, ticker)
+	}
+	sort.Strings(tickerNames)
+	for _, ticker := range tickerNames {
+		if err := runtime.registerTicker(ticker, commandsByTicker[ticker]); err != nil {
 			close(persistenceOut)
 			<-writerDone
-			return nil, fmt.Errorf("unsupported journal ticker %q", command.Ticker)
+			return nil, fmt.Errorf("restore ticker %q: %w", ticker, err)
 		}
 	}
-	if err := worker.Replay(commands); err != nil {
-		close(persistenceOut)
-		<-writerDone
-		return nil, fmt.Errorf("replay order journal: %w", err)
+
+	return runtime, nil
+}
+
+func (r *engineRuntime) AddTicker(ctx context.Context, ticker string) error {
+	ticker = strings.TrimSpace(ticker)
+	if ticker == "" {
+		return engine.ErrEmptyTicker
 	}
-	if err := router.Register("BTC-USD", worker); err != nil {
-		close(persistenceOut)
-		<-writerDone
-		return nil, fmt.Errorf("register BTC-USD worker: %w", err)
+
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if err := r.router.Ready(); err != nil {
+		return err
+	}
+	if r.router.HasTicker(ticker) {
+		return fmt.Errorf("%w: %s", engine.ErrTickerExists, ticker)
+	}
+
+	commands, err := r.journalStore.List(ctx)
+	if err != nil {
+		return fmt.Errorf("load order journal for ticker %q: %w", ticker, err)
+	}
+	tickerCommands := make([]journal.Command, 0)
+	for _, command := range commands {
+		if command.Ticker == ticker {
+			tickerCommands = append(tickerCommands, command)
+		}
+	}
+	if err := r.registerTicker(ticker, tickerCommands); err != nil {
+		return fmt.Errorf("restore ticker %q: %w", ticker, err)
+	}
+	return nil
+}
+
+func (r *engineRuntime) registerTicker(ticker string, commands []journal.Command) error {
+	worker := engine.NewBookWorkerWithOptions(ticker, nil, engine.BookWorkerOptions{
+		InputBufferSize: r.workerInputBufferSize,
+		PersistenceOut:  r.persistenceOut,
+		Journal:         r.journalStore,
+	})
+	if err := worker.Replay(commands); err != nil {
+		return fmt.Errorf("replay order journal: %w", err)
+	}
+	if err := r.router.Register(ticker, worker); err != nil {
+		return err
 	}
 	go worker.Run()
-
-	return &engineRuntime{
-		router:         router,
-		persistenceOut: persistenceOut,
-		writerDone:     writerDone,
-	}, nil
+	return nil
 }
 
 func (r *engineRuntime) shutdown(ctx context.Context) error {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
 	if err := r.router.Shutdown(ctx); err != nil {
 		return err
 	}

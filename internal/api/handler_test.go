@@ -19,6 +19,16 @@ type testJournal struct {
 	sequence int64
 }
 
+type testTickerAdder struct {
+	ticker string
+	err    error
+}
+
+func (a *testTickerAdder) AddTicker(_ context.Context, ticker string) error {
+	a.ticker = ticker
+	return a.err
+}
+
 func (j *testJournal) Append(_ context.Context, command journal.Command) (journal.AppendResult, error) {
 	j.sequence++
 	command.Sequence = j.sequence
@@ -137,6 +147,34 @@ func TestAmendAndCancelOrderCommands(t *testing.T) {
 	}
 	if len(snapshot.Bids) != 0 {
 		t.Fatalf("cancel command was not processed: %#v", snapshot)
+	}
+}
+
+func TestAddTickerCommand(t *testing.T) {
+	adder := &testTickerAdder{}
+	handler := NewHandlerWithTickerAdder(engine.NewRouter(), adder)
+
+	response := serveJSON(handler, "/commands/tickers/add", []byte(`{"ticker":" ETH-USD "}`))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status want %d, got %d: %s", http.StatusCreated, response.Code, response.Body.String())
+	}
+	if adder.ticker != "ETH-USD" {
+		t.Fatalf("ticker adder got %q, want ETH-USD", adder.ticker)
+	}
+}
+
+func TestAddTickerCommandRejectsUnavailableOrConflictingAdder(t *testing.T) {
+	withoutAdder := NewHandler(engine.NewRouter())
+	response := serveJSON(withoutAdder, "/commands/tickers/add", []byte(`{"ticker":"ETH-USD"}`))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing adder status want %d, got %d: %s", http.StatusServiceUnavailable, response.Code, response.Body.String())
+	}
+
+	adder := &testTickerAdder{err: engine.ErrTickerExists}
+	withConflict := NewHandlerWithTickerAdder(engine.NewRouter(), adder)
+	response = serveJSON(withConflict, "/commands/tickers/add", []byte(`{"ticker":"ETH-USD"}`))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("conflicting ticker status want %d, got %d: %s", http.StatusConflict, response.Code, response.Body.String())
 	}
 }
 

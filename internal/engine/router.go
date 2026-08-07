@@ -10,6 +10,7 @@ import (
 var (
 	ErrEmptyTicker   = errors.New("empty ticker")
 	ErrUnknownTicker = errors.New("unknown ticker")
+	ErrTickerExists  = errors.New("ticker already registered")
 	ErrRouterClosed  = errors.New("router closed")
 )
 
@@ -50,9 +51,20 @@ func (r *Router) Register(ticker string, w *BookWorker) error {
 	if r.closed {
 		return ErrRouterClosed
 	}
+	if _, exists := r.workers[ticker]; exists {
+		return fmt.Errorf("%w: %s", ErrTickerExists, ticker)
+	}
 	w.state = r.state
 	r.workers[ticker] = w
 	return nil
+}
+
+// HasTicker reports whether a worker is registered for the ticker.
+func (r *Router) HasTicker(ticker string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.workers[ticker]
+	return ok
 }
 
 func (r *Router) OrderRouter(ev Event) error {

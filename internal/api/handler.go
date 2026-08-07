@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,7 +16,13 @@ import (
 const maxRequestBodySize = 1 << 20
 
 type handler struct {
-	router *engine.Router
+	router      *engine.Router
+	tickerAdder TickerAdder
+}
+
+// TickerAdder registers a ticker and prepares its worker for command intake.
+type TickerAdder interface {
+	AddTicker(context.Context, string) error
 }
 
 type statusResponse struct {
@@ -27,13 +34,23 @@ type errorResponse struct {
 }
 
 func NewHandler(router *engine.Router) http.Handler {
-	h := &handler{router: router}
+	return newHandler(router, nil)
+}
+
+// NewHandlerWithTickerAdder adds the internal ticker management endpoint.
+func NewHandlerWithTickerAdder(router *engine.Router, adder TickerAdder) http.Handler {
+	return newHandler(router, adder)
+}
+
+func newHandler(router *engine.Router, adder TickerAdder) http.Handler {
+	h := &handler{router: router, tickerAdder: adder}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ready", h.ready)
 	mux.HandleFunc("GET /queries/orderbook", h.orderBook)
 	mux.HandleFunc("POST /commands/orders/create", h.createOrder)
 	mux.HandleFunc("POST /commands/orders/amend", h.amendOrder)
 	mux.HandleFunc("POST /commands/orders/cancel", h.cancelOrder)
+	mux.HandleFunc("POST /commands/tickers/add", h.addTicker)
 	return mux
 }
 
@@ -103,6 +120,27 @@ func (h *handler) cancelOrder(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type addTickerRequest struct {
+	Ticker string `json:"ticker"`
+}
+
+func (h *handler) addTicker(w http.ResponseWriter, r *http.Request) {
+	var request addTickerRequest
+	if !decodeJSON(w, r, &request) || strings.TrimSpace(request.Ticker) == "" {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if h.tickerAdder == nil {
+		writeError(w, http.StatusServiceUnavailable, "ticker management unavailable")
+		return
+	}
+	if err := h.tickerAdder.AddTicker(r.Context(), strings.TrimSpace(request.Ticker)); err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, statusResponse{Status: "added"})
+}
+
 func (h *handler) acceptCommand(w http.ResponseWriter, event engine.Event) {
 	if err := h.router.OrderRouter(event); err != nil {
 		writeEngineError(w, err)
@@ -141,6 +179,8 @@ func writeEngineError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, engine.ErrUnknownTicker):
 		writeError(w, http.StatusNotFound, "unknown ticker")
+	case errors.Is(err, engine.ErrTickerExists):
+		writeError(w, http.StatusConflict, "ticker already exists")
 	case errors.Is(err, engine.ErrEmptyTicker):
 		writeError(w, http.StatusBadRequest, "invalid request")
 	case errors.Is(err, engine.ErrEngineHalted):
