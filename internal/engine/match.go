@@ -14,8 +14,9 @@ type MatchResult struct {
 }
 
 // Match consumes an incoming order against the provided orderbook.
-// It should execute fills while bestBid >= bestAsk and return any residual portion
-// that needs to rest on the book (or nil if fully filled).
+// Limit orders execute only while their price crosses the best opposite level.
+// Market orders consume the best opposite levels without a price limit. Any
+// residual is returned to the caller, which decides whether it may rest.
 func Match(book *OrderBook, incoming *models.BookOrder) MatchResult {
 	if book == nil || incoming == nil {
 		return MatchResult{Residual: incoming}
@@ -28,7 +29,7 @@ func Match(book *OrderBook, incoming *models.BookOrder) MatchResult {
 	case models.Bid:
 		for {
 			bestAsk := book.askLevels.Peek()
-			if bestAsk == nil || incoming.Amount <= 0 || incoming.Price < bestAsk.Price {
+			if bestAsk == nil || incoming.Amount <= 0 || !canMatchAtPrice(incoming, bestAsk.Price) {
 				break
 			}
 			elem := bestAsk.Queue.Front()
@@ -60,7 +61,7 @@ func Match(book *OrderBook, incoming *models.BookOrder) MatchResult {
 	case models.Ask:
 		for {
 			bestBid := book.bidLevels.Peek()
-			if bestBid == nil || incoming.Amount <= 0 || incoming.Price > bestBid.Price {
+			if bestBid == nil || incoming.Amount <= 0 || !canMatchAtPrice(incoming, bestBid.Price) {
 				break
 			}
 			elem := bestBid.Queue.Front()
@@ -95,6 +96,17 @@ func Match(book *OrderBook, incoming *models.BookOrder) MatchResult {
 	}
 	result.Residual = incoming
 	return result
+}
+
+func canMatchAtPrice(incoming *models.BookOrder, oppositePrice float64) bool {
+	if incoming.OrderType == models.Market {
+		return true
+	}
+
+	if incoming.Position == models.Bid {
+		return incoming.Price >= oppositePrice
+	}
+	return incoming.Price <= oppositePrice
 }
 
 func newMatchLog(ticker string, taker, maker *models.BookOrder, price, amount float64, sequence int) matchlog.MatchLog {

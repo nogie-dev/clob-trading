@@ -210,6 +210,86 @@ func TestMatchMultiLevel_AskSweepsBids(t *testing.T) {
 	}
 }
 
+func TestMatchMarketOrderSweepsAvailableAskLevels(t *testing.T) {
+	ob := NewOrderBook("BTC-USD")
+	ob.AddOrder(newOrder("ask-100", models.Ask, 100, 0.3))
+	ob.AddOrder(newOrder("ask-101", models.Ask, 101, 0.3))
+
+	taker := newOrder("market-bid-1", models.Bid, 0, 0.5)
+	taker.OrderType = models.Market
+	result := Match(ob, taker)
+
+	if result.Residual != nil {
+		t.Fatalf("market order should be fully filled when liquidity is available, got residual %v", result.Residual.Amount)
+	}
+	if len(result.Logs) != 2 || result.Logs[0].Price != 100 || result.Logs[1].Price != 101 {
+		t.Fatalf("market order should consume best asks in order, got logs %#v", result.Logs)
+	}
+	if _, ok := ob.Asks[100]; ok {
+		t.Fatal("best ask should be fully consumed")
+	}
+	if lvl, ok := ob.Asks[101]; !ok || !approxEqual(lvl.TotalAmount, 0.1) {
+		t.Fatalf("remaining ask@101 want 0.1, got %#v", lvl)
+	}
+}
+
+func TestMatchMarketSellSweepsAvailableBidLevels(t *testing.T) {
+	ob := NewOrderBook("BTC-USD")
+	ob.AddOrder(newOrder("bid-102", models.Bid, 102, 0.3))
+	ob.AddOrder(newOrder("bid-101", models.Bid, 101, 0.3))
+
+	taker := newOrder("market-ask-1", models.Ask, 0, 0.5)
+	taker.OrderType = models.Market
+	result := Match(ob, taker)
+
+	if result.Residual != nil {
+		t.Fatalf("market order should be fully filled when liquidity is available, got residual %v", result.Residual.Amount)
+	}
+	if len(result.Logs) != 2 || result.Logs[0].Price != 102 || result.Logs[1].Price != 101 {
+		t.Fatalf("market order should consume best bids in order, got logs %#v", result.Logs)
+	}
+	if _, ok := ob.Bids[102]; ok {
+		t.Fatal("best bid should be fully consumed")
+	}
+	if lvl, ok := ob.Bids[101]; !ok || !approxEqual(lvl.TotalAmount, 0.1) {
+		t.Fatalf("remaining bid@101 want 0.1, got %#v", lvl)
+	}
+}
+
+func TestMatchMarketOrderReturnsUnfilledResidual(t *testing.T) {
+	ob := NewOrderBook("BTC-USD")
+	ob.AddOrder(newOrder("ask-100", models.Ask, 100, 0.3))
+
+	taker := newOrder("market-bid-1", models.Bid, 0, 1.0)
+	taker.OrderType = models.Market
+	result := Match(ob, taker)
+
+	if result.Residual == nil || !approxEqual(result.Residual.Amount, 0.7) {
+		t.Fatalf("market residual want 0.7, got %#v", result.Residual)
+	}
+	if _, ok := ob.Asks[100]; ok {
+		t.Fatal("available ask should be consumed before residual cancellation")
+	}
+}
+
+func TestMatchMarketOrderWithoutLiquidityReturnsFullResidual(t *testing.T) {
+	ob := NewOrderBook("BTC-USD")
+	taker := newOrder("market-bid-1", models.Bid, 0, 1.0)
+	taker.OrderType = models.Market
+
+	result := Match(ob, taker)
+
+	if result.Residual == nil || result.Residual.Amount != 1.0 {
+		t.Fatalf("market residual want 1.0, got %#v", result.Residual)
+	}
+	if len(result.Logs) != 0 {
+		t.Fatalf("market order without liquidity must not emit executions: %#v", result.Logs)
+	}
+	if len(ob.Index) != 0 || len(ob.Bids) != 0 || len(ob.Asks) != 0 {
+		t.Fatalf("market order without liquidity must not change the book: %#v", ob.Snapshot(1))
+	}
+}
+
 // --- 가격 우선 ---
 
 // 동일 BID taker에 대해 여러 ASK 레벨이 있을 때 가장 낮은 가격(best ask)부터 체결된다.

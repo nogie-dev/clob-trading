@@ -151,6 +151,98 @@ func TestBookWorkerEmitsMatchLogs(t *testing.T) {
 	}
 }
 
+func TestBookWorkerCancelsMarketResidualInsteadOfResting(t *testing.T) {
+	persistenceOut := make(chan matchlog.PersistenceRequest, 1)
+	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
+		PersistenceOut: persistenceOut,
+		Journal:        &testJournalStore{},
+	})
+	worker.OrderBook.AddOrder(newOrder("ask-1", models.Ask, 100, 0.25))
+
+	router := NewRouter()
+	if err := router.Register("BTC-USD", worker); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	go worker.Run()
+
+	logs := make(chan []matchlog.MatchLog, 1)
+	go func() {
+		request := <-persistenceOut
+		logs <- request.Logs
+		request.Acknowledge(nil)
+	}()
+
+	err := router.OrderRouter(Event{
+		Type:   NewOrder,
+		Ticker: "BTC-USD",
+		NewOrder: &models.CreateOrderRequest{
+			CommandID: "market-create-1",
+			Ticker:    "BTC-USD",
+			UserID:    "taker-user",
+			OrderType: models.Market,
+			Position:  models.Bid,
+			Amount:    1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("market order returned error: %v", err)
+	}
+	if got := <-logs; len(got) != 1 || got[0].Amount != 0.25 {
+		t.Fatalf("unexpected market execution logs: %#v", got)
+	}
+	if len(worker.OrderBook.Index) != 0 || len(worker.OrderBook.Bids) != 0 {
+		t.Fatalf("market residual must not rest on the book: %#v", worker.OrderBook.Snapshot(1))
+	}
+
+	shutdownRouter(t, router)
+}
+
+func TestBookWorkerCancelsMarketSellResidualInsteadOfResting(t *testing.T) {
+	persistenceOut := make(chan matchlog.PersistenceRequest, 1)
+	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
+		PersistenceOut: persistenceOut,
+		Journal:        &testJournalStore{},
+	})
+	worker.OrderBook.AddOrder(newOrder("bid-1", models.Bid, 100, 0.25))
+
+	router := NewRouter()
+	if err := router.Register("BTC-USD", worker); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	go worker.Run()
+
+	logs := make(chan []matchlog.MatchLog, 1)
+	go func() {
+		request := <-persistenceOut
+		logs <- request.Logs
+		request.Acknowledge(nil)
+	}()
+
+	err := router.OrderRouter(Event{
+		Type:   NewOrder,
+		Ticker: "BTC-USD",
+		NewOrder: &models.CreateOrderRequest{
+			CommandID: "market-sell-1",
+			Ticker:    "BTC-USD",
+			UserID:    "taker-user",
+			OrderType: models.Market,
+			Position:  models.Ask,
+			Amount:    1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("market order returned error: %v", err)
+	}
+	if got := <-logs; len(got) != 1 || got[0].Amount != 0.25 {
+		t.Fatalf("unexpected market execution logs: %#v", got)
+	}
+	if len(worker.OrderBook.Index) != 0 || len(worker.OrderBook.Asks) != 0 {
+		t.Fatalf("market residual must not rest on the book: %#v", worker.OrderBook.Snapshot(1))
+	}
+
+	shutdownRouter(t, router)
+}
+
 func TestBookWorkerWaitsForPersistenceBeforeNextCommand(t *testing.T) {
 	persistenceOut := make(chan matchlog.PersistenceRequest, 1)
 	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
@@ -528,6 +620,22 @@ func TestBookWorkerReplayIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestBookWorkerReplayCancelsMarketResidualDeterministically(t *testing.T) {
+	commands := marketReplayCommands()
+	firstLogs := replayLogs(t, commands)
+	secondLogs := replayLogs(t, commands)
+
+	if len(firstLogs) != 1 || len(secondLogs) != 1 {
+		t.Fatalf("replayed market logs want 1/1, got %d/%d", len(firstLogs), len(secondLogs))
+	}
+	if firstLogs[0].Amount != 0.25 || firstLogs[0].Price != 100 {
+		t.Fatalf("unexpected replayed market execution: %#v", firstLogs[0])
+	}
+	if firstLogs[0].ExecutionID != secondLogs[0].ExecutionID || firstLogs[0].MatchedAt != secondLogs[0].MatchedAt {
+		t.Fatalf("market replay produced different execution identity: %#v / %#v", firstLogs[0], secondLogs[0])
+	}
+}
+
 func TestBookWorkerReplayAppliesAmendAndCancel(t *testing.T) {
 	baseTime := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 	create := models.CreateOrderRequest{
@@ -568,6 +676,21 @@ func replayCommands() []journal.Command {
 		{
 			CommandID: "taker-command", Ticker: "BTC-USD", Sequence: 2, Type: journal.CreateCommand, RecordedAt: takerTime,
 			Create: &models.CreateOrderRequest{CommandID: "taker-command", Ticker: "BTC-USD", UserID: "taker", OrderType: models.Limit, Position: models.Bid, Price: 100, Amount: 1, Nonce: 1},
+		},
+	}
+}
+
+func marketReplayCommands() []journal.Command {
+	makerTime := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	takerTime := makerTime.Add(time.Second)
+	return []journal.Command{
+		{
+			CommandID: "maker-command", Ticker: "BTC-USD", Sequence: 1, Type: journal.CreateCommand, RecordedAt: makerTime,
+			Create: &models.CreateOrderRequest{CommandID: "maker-command", Ticker: "BTC-USD", UserID: "maker", OrderType: models.Limit, Position: models.Ask, Price: 100, Amount: 0.25, Nonce: 1},
+		},
+		{
+			CommandID: "market-command", Ticker: "BTC-USD", Sequence: 2, Type: journal.CreateCommand, RecordedAt: takerTime,
+			Create: &models.CreateOrderRequest{CommandID: "market-command", Ticker: "BTC-USD", UserID: "taker", OrderType: models.Market, Position: models.Bid, Amount: 1, Nonce: 1},
 		},
 	}
 }

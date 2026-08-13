@@ -109,10 +109,17 @@ func Validate(command Command) error {
 			return fmt.Errorf("%w: create payload is required", ErrInvalidCommand)
 		}
 		payloadCommandID, payloadTicker = command.Create.CommandID, command.Create.Ticker
+		validPrice := false
+		switch command.Create.OrderType {
+		case models.Limit:
+			validPrice = command.Create.Price > 0
+		case models.Market:
+			validPrice = command.Create.Price == 0
+		}
 		if strings.TrimSpace(command.Create.UserID) == "" ||
-			command.Create.OrderType != models.Limit ||
+			(command.Create.OrderType != models.Limit && command.Create.OrderType != models.Market) ||
 			(command.Create.Position != models.Bid && command.Create.Position != models.Ask) ||
-			command.Create.Price <= 0 || command.Create.Amount <= 0 {
+			!validPrice || command.Create.Amount <= 0 {
 			return fmt.Errorf("%w: invalid create payload", ErrInvalidCommand)
 		}
 	case AmendCommand:

@@ -14,6 +14,9 @@ In scope:
 
 - Command-oriented order API:
   - `POST /commands/orders/create` creates an order command.
+    Limit orders require a positive price. Market orders omit price, consume
+    available opposite-side liquidity without a protection price, and cancel
+    any unfilled remainder instead of resting it on the orderbook.
   - `POST /commands/orders/amend` amends an active order.
   - `POST /commands/orders/cancel` cancels an active order; it does not erase history.
   - Every command requires a stable upstream `command_id` used for journal idempotency.
@@ -56,7 +59,8 @@ Implementation shape:
 - Return command success only after the durable journal append and any
   match-log commit acknowledgement finish; queue enqueueing alone is not an
   accepted command.
-- Accept limit order commands only until market-order matching and residual behavior are defined in the engine.
+- Accept limit and market order commands according to the engine's documented
+  price and residual policies.
 
 Verify:
 

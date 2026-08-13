@@ -103,6 +103,32 @@ func TestCreateOrderCommand(t *testing.T) {
 	}
 }
 
+func TestCreateMarketOrderWithoutPrice(t *testing.T) {
+	handler, router := newTestHandler(t, nil)
+	body := []byte(`{
+		"command_id":"market-create-1",
+		"ticker":"BTC-USD",
+		"user_id":"alice",
+		"order_type":"MARKET",
+		"position":"BID",
+		"amount":2,
+		"nonce":1
+	}`)
+
+	response := serveJSON(handler, "/commands/orders/create", body)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status want %d, got %d: %s", http.StatusAccepted, response.Code, response.Body.String())
+	}
+
+	snapshot, err := router.OrderBookSnapshot("BTC-USD", 1)
+	if err != nil {
+		t.Fatalf("OrderBookSnapshot returned error: %v", err)
+	}
+	if len(snapshot.Bids) != 0 || len(snapshot.Asks) != 0 {
+		t.Fatalf("unmatched market order should not rest on the book: %#v", snapshot)
+	}
+}
+
 func TestAmendAndCancelOrderCommands(t *testing.T) {
 	book := engine.NewOrderBook("BTC-USD")
 	book.AddOrder(&models.BookOrder{OrderID: "bid-1", Ticker: "BTC-USD", Position: models.Bid, Price: 100, Amount: 2})
@@ -191,7 +217,10 @@ func TestHandlerRejectsInvalidRequestsAndUnknownTickers(t *testing.T) {
 		{name: "unknown query ticker", method: http.MethodGet, target: "/queries/orderbook?ticker=ETH-USD&depth=1", status: http.StatusNotFound},
 		{name: "malformed create", method: http.MethodPost, target: "/commands/orders/create", body: `{`, status: http.StatusBadRequest},
 		{name: "invalid create", method: http.MethodPost, target: "/commands/orders/create", body: `{"ticker":"BTC-USD"}`, status: http.StatusBadRequest},
-		{name: "unsupported market order", method: http.MethodPost, target: "/commands/orders/create", body: `{"command_id":"create-1","ticker":"BTC-USD","user_id":"alice","order_type":"MARKET","position":"BID","price":100,"amount":1}`, status: http.StatusBadRequest},
+		{name: "limit order without price", method: http.MethodPost, target: "/commands/orders/create", body: `{"command_id":"create-1","ticker":"BTC-USD","user_id":"alice","order_type":"LIMIT","position":"BID","amount":1}`, status: http.StatusBadRequest},
+		{name: "market order with price", method: http.MethodPost, target: "/commands/orders/create", body: `{"command_id":"create-1","ticker":"BTC-USD","user_id":"alice","order_type":"MARKET","position":"BID","price":100,"amount":1}`, status: http.StatusBadRequest},
+		{name: "market order with negative price", method: http.MethodPost, target: "/commands/orders/create", body: `{"command_id":"create-1","ticker":"BTC-USD","user_id":"alice","order_type":"MARKET","position":"BID","price":-1,"amount":1}`, status: http.StatusBadRequest},
+		{name: "unknown order type", method: http.MethodPost, target: "/commands/orders/create", body: `{"command_id":"create-1","ticker":"BTC-USD","user_id":"alice","order_type":"STOP","position":"BID","price":100,"amount":1}`, status: http.StatusBadRequest},
 		{name: "unknown create ticker", method: http.MethodPost, target: "/commands/orders/create", body: `{"command_id":"create-1","ticker":"ETH-USD","user_id":"alice","order_type":"LIMIT","position":"BID","price":100,"amount":1}`, status: http.StatusNotFound},
 		{name: "invalid amend", method: http.MethodPost, target: "/commands/orders/amend", body: `{"command_id":"amend-1","ticker":"BTC-USD","order_id":"id","price":100,"amount":0}`, status: http.StatusBadRequest},
 		{name: "invalid cancel", method: http.MethodPost, target: "/commands/orders/cancel", body: `{"command_id":"cancel-1","ticker":"BTC-USD"}`, status: http.StatusBadRequest},

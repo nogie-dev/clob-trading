@@ -150,12 +150,20 @@ func (h *handler) acceptCommand(w http.ResponseWriter, event engine.Event) {
 }
 
 func validCreateOrder(request models.CreateOrderRequest) bool {
+	validPrice := false
+	switch request.OrderType {
+	case models.Limit:
+		validPrice = request.Price > 0
+	case models.Market:
+		validPrice = request.Price == 0
+	}
+
 	return strings.TrimSpace(request.CommandID) != "" &&
 		strings.TrimSpace(request.Ticker) != "" &&
 		strings.TrimSpace(request.UserID) != "" &&
-		request.OrderType == models.Limit &&
+		(request.OrderType == models.Limit || request.OrderType == models.Market) &&
 		(request.Position == models.Bid || request.Position == models.Ask) &&
-		request.Price > 0 && request.Amount > 0
+		validPrice && request.Amount > 0
 }
 
 func validEditOrder(request models.EditOrderRequest) bool {

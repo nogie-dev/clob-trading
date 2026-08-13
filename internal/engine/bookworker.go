@@ -8,6 +8,7 @@ import (
 
 	"github.com/nogie-dev/clob-trading/internal/journal"
 	"github.com/nogie-dev/clob-trading/internal/matchlog"
+	"github.com/nogie-dev/clob-trading/internal/models"
 )
 
 const DefaultWorkerInputBufferSize = 128
@@ -185,12 +186,16 @@ func (w *BookWorker) applyCommand(command journal.Command) error {
 			return err
 		}
 		if result.Residual != nil {
-			w.OrderBook.AddOrder(result.Residual)
-			reason := "no_match"
-			if result.Residual.Amount < originalAmount {
-				reason = "partial_fill"
+			if order.OrderType == models.Market {
+				logOrderCancelled(result.Residual)
+			} else {
+				w.OrderBook.AddOrder(result.Residual)
+				reason := "no_match"
+				if result.Residual.Amount < originalAmount {
+					reason = "partial_fill"
+				}
+				logOrderResting(result.Residual, reason)
 			}
-			logOrderResting(result.Residual, reason)
 		}
 	case journal.AmendCommand:
 		updated := w.OrderBook.EditOrderAt(*command.Amend, command.RecordedAt)
