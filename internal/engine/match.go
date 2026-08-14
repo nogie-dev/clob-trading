@@ -9,8 +9,20 @@ import (
 )
 
 type MatchResult struct {
-	Residual *models.BookOrder
-	Logs     []matchlog.MatchLog
+	Residual         *models.BookOrder
+	Logs             []matchlog.MatchLog
+	MakerTransitions []MakerFillTransition
+}
+
+// MakerFillTransition captures one maker's quantity change for one execution.
+// Order is the immutable pre-execution snapshot used for order identity and
+// static metadata. The caller derives the incoming taker's aggregate outcome
+// separately from its original and residual amounts.
+type MakerFillTransition struct {
+	Order           models.BookOrder
+	PreviousAmount  float64
+	FilledAmount    float64
+	RemainingAmount float64
 }
 
 // Match consumes an incoming order against the provided orderbook.
@@ -42,12 +54,19 @@ func Match(book *OrderBook, incoming *models.BookOrder) MatchResult {
 				break
 			}
 
+			before := *target
 			tradeAmt := math.Min(incoming.Amount, target.Amount)
 			logTradeExecuted(incoming.Ticker, incoming.OrderID, target.OrderID, bestAsk.Price, tradeAmt)
 			result.Logs = append(result.Logs, newMatchLog(book.Ticker, incoming, target, bestAsk.Price, tradeAmt, len(result.Logs)))
 			incoming.Amount -= tradeAmt
 			target.Amount -= tradeAmt
 			bestAsk.TotalAmount -= tradeAmt
+			result.MakerTransitions = append(result.MakerTransitions, MakerFillTransition{
+				Order:           before,
+				PreviousAmount:  before.Amount,
+				FilledAmount:    tradeAmt,
+				RemainingAmount: target.Amount,
+			})
 
 			if target.Amount <= 0 {
 				bestAsk.Queue.Remove(elem)
@@ -74,12 +93,19 @@ func Match(book *OrderBook, incoming *models.BookOrder) MatchResult {
 				break
 			}
 
+			before := *target
 			tradeAmt := math.Min(incoming.Amount, target.Amount)
 			logTradeExecuted(incoming.Ticker, incoming.OrderID, target.OrderID, bestBid.Price, tradeAmt)
 			result.Logs = append(result.Logs, newMatchLog(book.Ticker, incoming, target, bestBid.Price, tradeAmt, len(result.Logs)))
 			incoming.Amount -= tradeAmt
 			target.Amount -= tradeAmt
 			bestBid.TotalAmount -= tradeAmt
+			result.MakerTransitions = append(result.MakerTransitions, MakerFillTransition{
+				Order:           before,
+				PreviousAmount:  before.Amount,
+				FilledAmount:    tradeAmt,
+				RemainingAmount: target.Amount,
+			})
 
 			if target.Amount <= 0 {
 				bestBid.Queue.Remove(elem)

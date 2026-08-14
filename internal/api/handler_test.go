@@ -13,6 +13,7 @@ import (
 	"github.com/nogie-dev/clob-trading/internal/engine"
 	"github.com/nogie-dev/clob-trading/internal/journal"
 	"github.com/nogie-dev/clob-trading/internal/models"
+	"github.com/nogie-dev/clob-trading/internal/orderevent"
 )
 
 type testJournal struct {
@@ -42,8 +43,8 @@ func (j *testJournal) List(context.Context) ([]journal.Command, error) {
 
 func TestOrderBookQuery(t *testing.T) {
 	book := engine.NewOrderBook("BTC-USD")
-	book.AddOrder(&models.BookOrder{OrderID: "bid-1", Position: models.Bid, Price: 100, Amount: 2})
-	book.AddOrder(&models.BookOrder{OrderID: "ask-1", Position: models.Ask, Price: 101, Amount: 3})
+	book.AddOrder(&models.BookOrder{OrderID: "bid-1", Ticker: "BTC-USD", UserID: "buyer", OrderType: models.Limit, Position: models.Bid, Price: 100, Amount: 2})
+	book.AddOrder(&models.BookOrder{OrderID: "ask-1", Ticker: "BTC-USD", UserID: "seller", OrderType: models.Limit, Position: models.Ask, Price: 101, Amount: 3})
 	handler, _ := newTestHandler(t, book)
 
 	request := httptest.NewRequest(http.MethodGet, "/queries/orderbook?ticker=BTC-USD&depth=1", nil)
@@ -131,7 +132,7 @@ func TestCreateMarketOrderWithoutPrice(t *testing.T) {
 
 func TestAmendAndCancelOrderCommands(t *testing.T) {
 	book := engine.NewOrderBook("BTC-USD")
-	book.AddOrder(&models.BookOrder{OrderID: "bid-1", Ticker: "BTC-USD", Position: models.Bid, Price: 100, Amount: 2})
+	book.AddOrder(&models.BookOrder{OrderID: "bid-1", Ticker: "BTC-USD", UserID: "alice", OrderType: models.Limit, Position: models.Bid, Price: 100, Amount: 2})
 	handler, router := newTestHandler(t, book)
 
 	amendedAmount := 1.0
@@ -285,7 +286,23 @@ func TestReadinessAndCommandsFailWhenEngineHalted(t *testing.T) {
 func newTestHandler(t *testing.T, book *engine.OrderBook) (http.Handler, *engine.Router) {
 	t.Helper()
 
-	worker := engine.NewBookWorkerWithOptions("BTC-USD", book, engine.BookWorkerOptions{Journal: &testJournal{}})
+	orderEventOut := make(chan orderevent.PersistenceRequest, 16)
+	orderEventDone := make(chan struct{})
+	go func() {
+		defer close(orderEventDone)
+		for request := range orderEventOut {
+			request.Acknowledge(nil)
+		}
+	}()
+	t.Cleanup(func() {
+		close(orderEventOut)
+		<-orderEventDone
+	})
+
+	worker := engine.NewBookWorkerWithOptions("BTC-USD", book, engine.BookWorkerOptions{
+		OrderEventOut: orderEventOut,
+		Journal:       &testJournal{},
+	})
 	router := engine.NewRouter()
 	if err := router.Register("BTC-USD", worker); err != nil {
 		t.Fatalf("Register returned error: %v", err)

@@ -25,6 +25,8 @@ import (
 	marketpostgres "github.com/nogie-dev/clob-trading/internal/market/postgres"
 	"github.com/nogie-dev/clob-trading/internal/matchlog"
 	matchlogpostgres "github.com/nogie-dev/clob-trading/internal/matchlog/postgres"
+	"github.com/nogie-dev/clob-trading/internal/orderevent"
+	ordereventpostgres "github.com/nogie-dev/clob-trading/internal/orderevent/postgres"
 )
 
 const databaseURLEnv = "MATCHING_ENGINE_DATABASE_URL"
@@ -33,6 +35,8 @@ type engineRuntime struct {
 	router                *engine.Router
 	persistenceOut        chan matchlog.PersistenceRequest
 	writerDone            chan struct{}
+	orderEventOut         chan orderevent.PersistenceRequest
+	orderEventWriterDone  chan struct{}
 	journalStore          journal.Store
 	marketStore           market.Store
 	workerInputBufferSize int
@@ -84,6 +88,7 @@ func serve(cfg config.Config, address, databaseURL string) error {
 		matchlogpostgres.NewStore(pool),
 		journalpostgres.NewStore(pool),
 		marketpostgres.NewStore(pool),
+		ordereventpostgres.NewStore(pool),
 	)
 	if err != nil {
 		return err
@@ -125,7 +130,14 @@ func serve(cfg config.Config, address, databaseURL string) error {
 	return errors.Join(httpShutdownErr, engineShutdownErr, listenErr)
 }
 
-func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Store, journalStore journal.Store, marketStore market.Store) (*engineRuntime, error) {
+func startEngine(
+	ctx context.Context,
+	cfg config.Config,
+	matchStore matchlog.Store,
+	journalStore journal.Store,
+	marketStore market.Store,
+	orderEventStore orderevent.Store,
+) (*engineRuntime, error) {
 	if matchStore == nil {
 		return nil, matchlog.ErrStoreUnavailable
 	}
@@ -135,6 +147,9 @@ func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Sto
 	if marketStore == nil {
 		return nil, market.ErrStoreUnavailable
 	}
+	if orderEventStore == nil {
+		return nil, orderevent.ErrStoreUnavailable
+	}
 	persistenceOut := make(chan matchlog.PersistenceRequest, cfg.Engine.MatchLogOutputBufferSize)
 	writerDone := make(chan struct{})
 	writer := matchlog.NewWriter(matchStore)
@@ -142,26 +157,40 @@ func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Sto
 		defer close(writerDone)
 		writer.Run(context.Background(), persistenceOut)
 	}()
+	orderEventOut := make(chan orderevent.PersistenceRequest, cfg.Engine.OrderEventOutputBufferSize)
+	orderEventWriterDone := make(chan struct{})
+	orderEventWriter := orderevent.NewWriter(orderEventStore)
+	go func() {
+		defer close(orderEventWriterDone)
+		orderEventWriter.Run(context.Background(), orderEventOut)
+	}()
 
 	router := engine.NewRouter()
 	runtime := &engineRuntime{
 		router:                router,
 		persistenceOut:        persistenceOut,
 		writerDone:            writerDone,
+		orderEventOut:         orderEventOut,
+		orderEventWriterDone:  orderEventWriterDone,
 		journalStore:          journalStore,
 		marketStore:           marketStore,
 		workerInputBufferSize: cfg.Engine.WorkerInputBufferSize,
 	}
+	cleanup := func() {
+		_ = router.Shutdown(context.Background())
+		close(persistenceOut)
+		close(orderEventOut)
+		<-writerDone
+		<-orderEventWriterDone
+	}
 	markets, err := marketStore.List(ctx)
 	if err != nil {
-		close(persistenceOut)
-		<-writerDone
+		cleanup()
 		return nil, fmt.Errorf("load markets: %w", err)
 	}
 	commands, err := journalStore.List(ctx)
 	if err != nil {
-		close(persistenceOut)
-		<-writerDone
+		cleanup()
 		return nil, fmt.Errorf("load order journal: %w", err)
 	}
 	commandsByTicker := make(map[string][]journal.Command)
@@ -173,8 +202,7 @@ func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Sto
 		commandsByTicker[command.Ticker] = append(commandsByTicker[command.Ticker], command)
 		if _, registered := tickers[command.Ticker]; !registered {
 			if _, err := marketStore.Add(ctx, command.Ticker); err != nil {
-				close(persistenceOut)
-				<-writerDone
+				cleanup()
 				return nil, fmt.Errorf("persist journal ticker %q: %w", command.Ticker, err)
 			}
 		}
@@ -187,8 +215,7 @@ func startEngine(ctx context.Context, cfg config.Config, matchStore matchlog.Sto
 	sort.Strings(tickerNames)
 	for _, ticker := range tickerNames {
 		if err := runtime.registerTicker(ticker, commandsByTicker[ticker]); err != nil {
-			close(persistenceOut)
-			<-writerDone
+			cleanup()
 			return nil, fmt.Errorf("restore ticker %q: %w", ticker, err)
 		}
 	}
@@ -234,6 +261,7 @@ func (r *engineRuntime) registerTicker(ticker string, commands []journal.Command
 	worker := engine.NewBookWorkerWithOptions(ticker, nil, engine.BookWorkerOptions{
 		InputBufferSize: r.workerInputBufferSize,
 		PersistenceOut:  r.persistenceOut,
+		OrderEventOut:   r.orderEventOut,
 		Journal:         r.journalStore,
 	})
 	if err := worker.Replay(commands); err != nil {
@@ -253,10 +281,18 @@ func (r *engineRuntime) shutdown(ctx context.Context) error {
 		return err
 	}
 	close(r.persistenceOut)
+	close(r.orderEventOut)
+	return errors.Join(
+		waitForWriter(ctx, r.writerDone, "match log"),
+		waitForWriter(ctx, r.orderEventWriterDone, "order event"),
+	)
+}
+
+func waitForWriter(ctx context.Context, done <-chan struct{}, name string) error {
 	select {
-	case <-r.writerDone:
+	case <-done:
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("shutdown match log writer: %w", ctx.Err())
+		return fmt.Errorf("shutdown %s writer: %w", name, ctx.Err())
 	}
 }

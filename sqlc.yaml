@@ -32,3 +32,13 @@ sql:
         sql_package: "pgx/v5"
         emit_json_tags: true
         emit_db_tags: true
+  - engine: "postgresql"
+    schema: "db/migrations/00005_create_order_events.sql"
+    queries: "db/query/order_events.sql"
+    gen:
+      go:
+        package: "db"
+        out: "internal/orderevent/postgres/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_db_tags: true

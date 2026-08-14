@@ -9,6 +9,7 @@ import (
 	"github.com/nogie-dev/clob-trading/internal/journal"
 	"github.com/nogie-dev/clob-trading/internal/matchlog"
 	"github.com/nogie-dev/clob-trading/internal/models"
+	"github.com/nogie-dev/clob-trading/internal/orderevent"
 )
 
 type testJournalStore struct {
@@ -45,6 +46,23 @@ func (s *testJournalStore) Append(_ context.Context, command journal.Command) (j
 
 func (s *testJournalStore) List(context.Context) ([]journal.Command, error) {
 	return nil, nil
+}
+
+func acceptingOrderEventOut(t *testing.T) chan orderevent.PersistenceRequest {
+	t.Helper()
+	out := make(chan orderevent.PersistenceRequest, 16)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for request := range out {
+			request.Acknowledge(nil)
+		}
+	}()
+	t.Cleanup(func() {
+		close(out)
+		<-done
+	})
+	return out
 }
 
 func routeAndDrain(t *testing.T, router *Router, worker *BookWorker, ev Event) {
@@ -104,6 +122,7 @@ func TestBookWorkerEmitsMatchLogs(t *testing.T) {
 	persistenceOut := make(chan matchlog.PersistenceRequest, 1)
 	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
 		PersistenceOut: persistenceOut,
+		OrderEventOut:  acceptingOrderEventOut(t),
 		Journal:        &testJournalStore{},
 	})
 	maker := newOrder("ask-1", models.Ask, 100, 0.5)
@@ -155,6 +174,7 @@ func TestBookWorkerCancelsMarketResidualInsteadOfResting(t *testing.T) {
 	persistenceOut := make(chan matchlog.PersistenceRequest, 1)
 	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
 		PersistenceOut: persistenceOut,
+		OrderEventOut:  acceptingOrderEventOut(t),
 		Journal:        &testJournalStore{},
 	})
 	worker.OrderBook.AddOrder(newOrder("ask-1", models.Ask, 100, 0.25))
@@ -201,6 +221,7 @@ func TestBookWorkerCancelsMarketSellResidualInsteadOfResting(t *testing.T) {
 	persistenceOut := make(chan matchlog.PersistenceRequest, 1)
 	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
 		PersistenceOut: persistenceOut,
+		OrderEventOut:  acceptingOrderEventOut(t),
 		Journal:        &testJournalStore{},
 	})
 	worker.OrderBook.AddOrder(newOrder("bid-1", models.Bid, 100, 0.25))
@@ -247,6 +268,7 @@ func TestBookWorkerWaitsForPersistenceBeforeNextCommand(t *testing.T) {
 	persistenceOut := make(chan matchlog.PersistenceRequest, 1)
 	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
 		PersistenceOut: persistenceOut,
+		OrderEventOut:  acceptingOrderEventOut(t),
 		Journal:        &testJournalStore{},
 	})
 	maker := newOrder("ask-1", models.Ask, 100, 0.5)
@@ -314,6 +336,125 @@ func TestBookWorkerWaitsForPersistenceBeforeNextCommand(t *testing.T) {
 		t.Fatalf("queued cancel was not processed after acknowledgement: %#v", snapshot.Asks)
 	}
 
+	shutdownRouter(t, router)
+}
+
+func TestBookWorkerWaitsForOrderEventPersistenceBeforeNextCommand(t *testing.T) {
+	orderEventOut := make(chan orderevent.PersistenceRequest, 2)
+	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
+		OrderEventOut: orderEventOut,
+		Journal:       &testJournalStore{},
+	})
+	router := NewRouter()
+	if err := router.Register("BTC-USD", worker); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	go worker.Run()
+
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- router.OrderRouter(Event{
+			Type:   NewOrder,
+			Ticker: "BTC-USD",
+			NewOrder: &models.CreateOrderRequest{
+				CommandID: "create-1",
+				Ticker:    "BTC-USD",
+				UserID:    "alice",
+				OrderType: models.Limit,
+				Position:  models.Bid,
+				Price:     100,
+				Amount:    1,
+				Nonce:     1,
+			},
+		})
+	}()
+
+	firstRequest := <-orderEventOut
+	if len(firstRequest.Events) != 1 || firstRequest.Events[0].Type != orderevent.Resting {
+		t.Fatalf("first event batch want one resting event, got %#v", firstRequest.Events)
+	}
+	select {
+	case err := <-firstResult:
+		t.Fatalf("create completed before order event acknowledgement: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- router.OrderRouter(Event{
+			Type:   CancelOrder,
+			Ticker: "BTC-USD",
+			CancelReq: &models.CancelOrderRequest{
+				CommandID: "cancel-1",
+				Ticker:    "BTC-USD",
+				OrderID:   firstRequest.Events[0].OrderID,
+			},
+		})
+	}()
+	select {
+	case err := <-secondResult:
+		t.Fatalf("next command completed before first event acknowledgement: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	firstRequest.Acknowledge(nil)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("route create order: %v", err)
+	}
+
+	secondRequest := <-orderEventOut
+	if len(secondRequest.Events) != 1 || secondRequest.Events[0].Type != orderevent.Canceled {
+		t.Fatalf("second event batch want one canceled event, got %#v", secondRequest.Events)
+	}
+	select {
+	case err := <-secondResult:
+		t.Fatalf("cancel completed before its event acknowledgement: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	secondRequest.Acknowledge(nil)
+	if err := <-secondResult; err != nil {
+		t.Fatalf("route cancel order: %v", err)
+	}
+
+	shutdownRouter(t, router)
+}
+
+func TestBookWorkerOrderEventPersistenceFailureHaltsRouter(t *testing.T) {
+	orderEventOut := make(chan orderevent.PersistenceRequest, 1)
+	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
+		OrderEventOut: orderEventOut,
+		Journal:       &testJournalStore{},
+	})
+	router := NewRouter()
+	if err := router.Register("BTC-USD", worker); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	go worker.Run()
+
+	result := make(chan error, 1)
+	go func() {
+		result <- router.OrderRouter(Event{
+			Type:   NewOrder,
+			Ticker: "BTC-USD",
+			NewOrder: &models.CreateOrderRequest{
+				CommandID: "create-1",
+				Ticker:    "BTC-USD",
+				UserID:    "alice",
+				OrderType: models.Limit,
+				Position:  models.Bid,
+				Price:     100,
+				Amount:    1,
+				Nonce:     1,
+			},
+		})
+	}()
+
+	request := <-orderEventOut
+	request.Acknowledge(errors.New("order event database unavailable"))
+	if err := <-result; !errors.Is(err, ErrEngineHalted) {
+		t.Fatalf("failed event persistence want ErrEngineHalted, got %v", err)
+	}
+	waitForHalt(t, router)
 	shutdownRouter(t, router)
 }
 
@@ -473,7 +614,10 @@ func TestBookWorkerRejectsEditOrderPayloadTickerMismatch(t *testing.T) {
 }
 
 func TestRouterOrderBookSnapshotRunsAfterQueuedCommand(t *testing.T) {
-	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{Journal: &testJournalStore{}})
+	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
+		OrderEventOut: acceptingOrderEventOut(t),
+		Journal:       &testJournalStore{},
+	})
 	router := NewRouter()
 	if err := router.Register("BTC-USD", worker); err != nil {
 		t.Fatalf("Register returned error: %v", err)
@@ -526,7 +670,10 @@ func TestRouterOrderBookSnapshotRejectsUnknownTicker(t *testing.T) {
 
 func TestBookWorkerCommitsJournalBeforeBookMutation(t *testing.T) {
 	journalStore := &blockingJournalStore{started: make(chan struct{}), release: make(chan struct{})}
-	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{Journal: journalStore})
+	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
+		OrderEventOut: acceptingOrderEventOut(t),
+		Journal:       journalStore,
+	})
 	router := NewRouter()
 	if err := router.Register("BTC-USD", worker); err != nil {
 		t.Fatalf("Register returned error: %v", err)
@@ -656,7 +803,7 @@ func TestBookWorkerReplayAppliesAmendAndCancel(t *testing.T) {
 		},
 	}
 
-	worker := NewBookWorker("BTC-USD", nil)
+	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{OrderEventOut: acceptingOrderEventOut(t)})
 	if err := worker.Replay(commands); err != nil {
 		t.Fatalf("Replay returned error: %v", err)
 	}
@@ -698,7 +845,10 @@ func marketReplayCommands() []journal.Command {
 func replayLogs(t *testing.T, commands []journal.Command) []matchlog.MatchLog {
 	t.Helper()
 	persistenceOut := make(chan matchlog.PersistenceRequest, 1)
-	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{PersistenceOut: persistenceOut})
+	worker := NewBookWorkerWithOptions("BTC-USD", nil, BookWorkerOptions{
+		PersistenceOut: persistenceOut,
+		OrderEventOut:  acceptingOrderEventOut(t),
+	})
 	logs := make(chan []matchlog.MatchLog, 1)
 	go func() {
 		request := <-persistenceOut

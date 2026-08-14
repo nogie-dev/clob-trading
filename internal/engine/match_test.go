@@ -32,6 +32,9 @@ func TestMatchNoMatch_BidBelowAsk(t *testing.T) {
 	if _, ok := ob.Asks[101]; !ok {
 		t.Fatal("ask level should remain on book")
 	}
+	if len(result.MakerTransitions) != 0 {
+		t.Fatalf("no match must not produce maker transitions: %#v", result.MakerTransitions)
+	}
 }
 
 // ASK 가격이 best bid보다 높으면 체결되지 않는다.
@@ -368,6 +371,57 @@ func TestMatchReturnsRawMatchLogs(t *testing.T) {
 		log.MakerSide != models.Ask ||
 		log.TakerSide != models.Bid {
 		t.Fatalf("unexpected match log: %#v", log)
+	}
+}
+
+func TestMatchReturnsMakerTransitionsInExecutionOrder(t *testing.T) {
+	ob := NewOrderBook("BTC-USD")
+	first := newOrder("ask-100", models.Ask, 100, 0.3)
+	first.UserID = "maker-1"
+	first.OrderType = models.Limit
+	second := newOrder("ask-101", models.Ask, 101, 0.4)
+	second.UserID = "maker-2"
+	second.OrderType = models.Limit
+	ob.AddOrder(first)
+	ob.AddOrder(second)
+
+	taker := newOrder("bid-1", models.Bid, 101, 0.5)
+	result := Match(ob, taker)
+
+	if len(result.MakerTransitions) != 2 {
+		t.Fatalf("maker transitions want 2, got %d", len(result.MakerTransitions))
+	}
+	assertFillTransition(t, result.MakerTransitions[0], "ask-100", 0.3, 0.3, 0)
+	assertFillTransition(t, result.MakerTransitions[1], "ask-101", 0.4, 0.2, 0.2)
+	if len(result.Logs) != len(result.MakerTransitions) {
+		t.Fatalf("each execution must have one maker transition: logs=%d transitions=%d", len(result.Logs), len(result.MakerTransitions))
+	}
+}
+
+func TestMatchMakerTransitionSnapshotsDoNotTrackLaterMutation(t *testing.T) {
+	ob := NewOrderBook("BTC-USD")
+	maker := newOrder("bid-1", models.Bid, 100, 1)
+	ob.AddOrder(maker)
+
+	taker := newOrder("ask-1", models.Ask, 100, 0.4)
+	result := Match(ob, taker)
+	maker.Amount = 9
+
+	if len(result.MakerTransitions) != 1 {
+		t.Fatalf("maker transitions want 1, got %d", len(result.MakerTransitions))
+	}
+	assertFillTransition(t, result.MakerTransitions[0], "bid-1", 1, 0.4, 0.6)
+}
+
+func assertFillTransition(t *testing.T, transition MakerFillTransition, orderID string, previous, filled, remaining float64) {
+	t.Helper()
+	if transition.Order.OrderID != orderID ||
+		!approxEqual(transition.Order.Amount, previous) ||
+		!approxEqual(transition.PreviousAmount, previous) ||
+		!approxEqual(transition.FilledAmount, filled) ||
+		!approxEqual(transition.RemainingAmount, remaining) ||
+		!approxEqual(transition.PreviousAmount, transition.FilledAmount+transition.RemainingAmount) {
+		t.Fatalf("unexpected fill transition: %#v", transition)
 	}
 }
 

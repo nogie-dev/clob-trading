@@ -9,6 +9,7 @@ import (
 	"github.com/nogie-dev/clob-trading/internal/journal"
 	"github.com/nogie-dev/clob-trading/internal/matchlog"
 	"github.com/nogie-dev/clob-trading/internal/models"
+	"github.com/nogie-dev/clob-trading/internal/orderevent"
 )
 
 const DefaultWorkerInputBufferSize = 128
@@ -18,6 +19,7 @@ var ErrInvalidReplaySequence = errors.New("invalid replay sequence")
 type BookWorkerOptions struct {
 	InputBufferSize int
 	PersistenceOut  chan<- matchlog.PersistenceRequest
+	OrderEventOut   chan<- orderevent.PersistenceRequest
 	Journal         journal.Store
 	State           *EngineState
 }
@@ -27,6 +29,7 @@ type BookWorker struct {
 	OrderBook      *OrderBook
 	in             chan Event
 	persistenceOut chan<- matchlog.PersistenceRequest
+	orderEventOut  chan<- orderevent.PersistenceRequest
 	journalStore   journal.Store
 	state          *EngineState
 	done           chan struct{}
@@ -55,6 +58,7 @@ func NewBookWorkerWithOptions(ticker string, ob *OrderBook, opts BookWorkerOptio
 		OrderBook:      ob,
 		in:             make(chan Event, bufferSize),
 		persistenceOut: opts.PersistenceOut,
+		orderEventOut:  opts.OrderEventOut,
 		journalStore:   opts.Journal,
 		state:          state,
 		done:           make(chan struct{}),
@@ -104,7 +108,13 @@ func (w *BookWorker) Run() {
 			ev.acknowledge(nil)
 			continue
 		}
-		if err := w.applyCommand(appended.Command); err != nil {
+		events, err := w.applyCommand(appended.Command)
+		if err != nil {
+			w.halt(err)
+			ev.acknowledge(w.state.Err())
+			continue
+		}
+		if err := w.persistOrderEvents(events); err != nil {
 			w.halt(err)
 			ev.acknowledge(w.state.Err())
 			continue
@@ -121,9 +131,14 @@ func (w *BookWorker) Replay(commands []journal.Command) error {
 			w.state.Halt(err)
 			return err
 		}
-		if err := w.applyCommand(command); err != nil {
+		events, err := w.applyCommand(command)
+		if err != nil {
 			w.state.Halt(err)
 			return fmt.Errorf("replay command %q: %w", command.CommandID, err)
+		}
+		if err := w.persistOrderEvents(events); err != nil {
+			w.state.Halt(err)
+			return fmt.Errorf("replay order events for command %q: %w", command.CommandID, err)
 		}
 		lastSequence = command.Sequence
 	}
@@ -168,57 +183,75 @@ func (w *BookWorker) commandFromEvent(ev Event) (journal.Command, bool) {
 	}
 }
 
-func (w *BookWorker) applyCommand(command journal.Command) error {
+func (w *BookWorker) applyCommand(command journal.Command) ([]orderevent.Event, error) {
 	if err := journal.Validate(command); err != nil {
-		return err
+		return nil, err
 	}
 	if command.RecordedAt.IsZero() {
-		return fmt.Errorf("%w: recorded time is required", journal.ErrInvalidCommand)
+		return nil, fmt.Errorf("%w: recorded time is required", journal.ErrInvalidCommand)
 	}
+	events := newOrderEventBuilder(command)
 
 	switch command.Type {
 	case journal.CreateCommand:
 		order := CreateOrderAt(*command.Create, command.RecordedAt)
-		originalAmount := order.Amount
+		beforeMatch := order
 		logOrderReceived(&order)
 		result := Match(w.OrderBook, &order)
 		if err := w.persistMatchLogs(result.Logs); err != nil {
-			return err
+			return nil, err
 		}
+		events.addMakerFills(result.MakerTransitions)
+		filledAmount := beforeMatch.Amount - order.Amount
+		events.addTakerFill(beforeMatch, filledAmount, order.Amount)
 		if result.Residual != nil {
 			if order.OrderType == models.Market {
 				logOrderCancelled(result.Residual)
+				events.addRemainderCanceled(beforeMatch, result.Residual.Amount)
 			} else {
 				w.OrderBook.AddOrder(result.Residual)
 				reason := "no_match"
-				if result.Residual.Amount < originalAmount {
+				if filledAmount > 0 {
 					reason = "partial_fill"
+				} else {
+					events.addResting(beforeMatch)
 				}
 				logOrderResting(result.Residual, reason)
 			}
 		}
 	case journal.AmendCommand:
-		updated := w.OrderBook.EditOrderAt(*command.Amend, command.RecordedAt)
-		if updated == nil {
-			return nil
+		editResult := w.OrderBook.EditOrderAt(*command.Amend, command.RecordedAt)
+		if editResult == nil {
+			return events.result()
 		}
-		originalAmount := updated.Amount
-		result := Match(w.OrderBook, updated)
+		events.addAmended(editResult.Before, editResult.After)
+		if !editResult.RequiresRematch {
+			return events.result()
+		}
+		updated := editResult.After
+		beforeMatch := updated
+		result := Match(w.OrderBook, &updated)
 		if err := w.persistMatchLogs(result.Logs); err != nil {
-			return err
+			return nil, err
 		}
+		events.addMakerFills(result.MakerTransitions)
+		filledAmount := beforeMatch.Amount - updated.Amount
+		events.addTakerFill(beforeMatch, filledAmount, updated.Amount)
 		if result.Residual != nil {
 			w.OrderBook.AddOrder(result.Residual)
 			reason := "no_match"
-			if result.Residual.Amount < originalAmount {
+			if filledAmount > 0 {
 				reason = "partial_fill"
 			}
 			logOrderResting(result.Residual, reason)
 		}
 	case journal.CancelCommand:
-		w.OrderBook.RemoveOrder(command.Cancel.OrderID)
+		removed := w.OrderBook.RemoveOrder(command.Cancel.OrderID)
+		if removed != nil {
+			events.addCanceled(*removed)
+		}
 	}
-	return nil
+	return events.result()
 }
 
 func (w *BookWorker) persistMatchLogs(logs []matchlog.MatchLog) error {
@@ -231,6 +264,19 @@ func (w *BookWorker) persistMatchLogs(logs []matchlog.MatchLog) error {
 
 	request := matchlog.NewPersistenceRequest(logs)
 	w.persistenceOut <- request
+	return request.Wait()
+}
+
+func (w *BookWorker) persistOrderEvents(events []orderevent.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	if w.orderEventOut == nil {
+		return orderevent.ErrStoreUnavailable
+	}
+
+	request := orderevent.NewPersistenceRequest(events)
+	w.orderEventOut <- request
 	return request.Wait()
 }
 

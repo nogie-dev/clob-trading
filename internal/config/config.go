@@ -7,6 +7,7 @@ import (
 
 	"github.com/nogie-dev/clob-trading/internal/engine"
 	"github.com/nogie-dev/clob-trading/internal/matchlog"
+	"github.com/nogie-dev/clob-trading/internal/orderevent"
 )
 
 type Config struct {
@@ -14,15 +15,17 @@ type Config struct {
 }
 
 type EngineConfig struct {
-	WorkerInputBufferSize    int `json:"worker_input_buffer_size"`
-	MatchLogOutputBufferSize int `json:"match_log_output_buffer_size"`
+	WorkerInputBufferSize      int `json:"worker_input_buffer_size"`
+	MatchLogOutputBufferSize   int `json:"match_log_output_buffer_size"`
+	OrderEventOutputBufferSize int `json:"order_event_output_buffer_size"`
 }
 
 func Default() Config {
 	return Config{
 		Engine: EngineConfig{
-			WorkerInputBufferSize:    engine.DefaultWorkerInputBufferSize,
-			MatchLogOutputBufferSize: matchlog.DefaultOutputBufferSize,
+			WorkerInputBufferSize:      engine.DefaultWorkerInputBufferSize,
+			MatchLogOutputBufferSize:   matchlog.DefaultOutputBufferSize,
+			OrderEventOutputBufferSize: orderevent.DefaultOutputBufferSize,
 		},
 	}
 }
@@ -52,5 +55,8 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Engine.MatchLogOutputBufferSize <= 0 {
 		c.Engine.MatchLogOutputBufferSize = matchlog.DefaultOutputBufferSize
+	}
+	if c.Engine.OrderEventOutputBufferSize <= 0 {
+		c.Engine.OrderEventOutputBufferSize = orderevent.DefaultOutputBufferSize
 	}
 }

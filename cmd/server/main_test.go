@@ -13,6 +13,7 @@ import (
 	"github.com/nogie-dev/clob-trading/internal/market"
 	"github.com/nogie-dev/clob-trading/internal/matchlog"
 	"github.com/nogie-dev/clob-trading/internal/models"
+	"github.com/nogie-dev/clob-trading/internal/orderevent"
 )
 
 type recordingStore struct {
@@ -25,8 +26,36 @@ type idempotentStore struct {
 	err  error
 }
 
+type memoryOrderEventStore struct {
+	events map[string]orderevent.Event
+	err    error
+}
+
 func newIdempotentStore() *idempotentStore {
 	return &idempotentStore{logs: make(map[string]matchlog.MatchLog)}
+}
+
+func newMemoryOrderEventStore() *memoryOrderEventStore {
+	return &memoryOrderEventStore{events: make(map[string]orderevent.Event)}
+}
+
+func (s *memoryOrderEventStore) SaveEvent(ctx context.Context, event orderevent.Event) error {
+	return s.SaveEvents(ctx, []orderevent.Event{event})
+}
+
+func (s *memoryOrderEventStore) SaveEvents(_ context.Context, events []orderevent.Event) error {
+	if s.err != nil {
+		return s.err
+	}
+	for _, event := range events {
+		if existing, ok := s.events[event.EventID]; ok && !reflect.DeepEqual(existing, event) {
+			return errors.New("order event id conflict")
+		}
+	}
+	for _, event := range events {
+		s.events[event.EventID] = event
+	}
+	return nil
 }
 
 func (s *idempotentStore) SaveMatchLog(ctx context.Context, log matchlog.MatchLog) error {
@@ -161,15 +190,31 @@ func TestStartEngineFailsBeforeServingWhenJournalLoadFails(t *testing.T) {
 		newIdempotentStore(),
 		&memoryJournal{err: journalErr},
 		newMemoryMarketStore("BTC-USD"),
+		newMemoryOrderEventStore(),
 	)
 	if !errors.Is(err, journalErr) {
 		t.Fatalf("startEngine want journal load error, got %v", err)
 	}
 }
 
+func TestStartEngineRequiresOrderEventStore(t *testing.T) {
+	_, err := startEngine(
+		context.Background(),
+		config.Default(),
+		newIdempotentStore(),
+		&memoryJournal{},
+		newMemoryMarketStore("BTC-USD"),
+		nil,
+	)
+	if !errors.Is(err, orderevent.ErrStoreUnavailable) {
+		t.Fatalf("startEngine want order event store unavailable, got %v", err)
+	}
+}
+
 func TestEngineRuntimePersistsMatchBeforeShutdown(t *testing.T) {
 	store := &recordingStore{}
-	runtime, err := startEngine(context.Background(), config.Default(), store, &memoryJournal{}, newMemoryMarketStore("BTC-USD"))
+	orderEventStore := newMemoryOrderEventStore()
+	runtime, err := startEngine(context.Background(), config.Default(), store, &memoryJournal{}, newMemoryMarketStore("BTC-USD"), orderEventStore)
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
@@ -218,11 +263,21 @@ func TestEngineRuntimePersistsMatchBeforeShutdown(t *testing.T) {
 	if store.logs[0].ExecutionID == "" {
 		t.Fatal("persisted log must have an execution ID")
 	}
+	if len(orderEventStore.events) != 3 {
+		t.Fatalf("persisted order events want 3, got %d", len(orderEventStore.events))
+	}
+	eventTypes := make(map[orderevent.Type]int)
+	for _, event := range orderEventStore.events {
+		eventTypes[event.Type]++
+	}
+	if eventTypes[orderevent.Resting] != 1 || eventTypes[orderevent.Filled] != 2 {
+		t.Fatalf("unexpected persisted order event types: %#v", eventTypes)
+	}
 }
 
 func TestEngineRuntimeHaltsOnStoreFailure(t *testing.T) {
 	storeErr := errors.New("database unavailable")
-	runtime, err := startEngine(context.Background(), config.Default(), &recordingStore{err: storeErr}, &memoryJournal{}, newMemoryMarketStore("BTC-USD"))
+	runtime, err := startEngine(context.Background(), config.Default(), &recordingStore{err: storeErr}, &memoryJournal{}, newMemoryMarketStore("BTC-USD"), newMemoryOrderEventStore())
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
@@ -258,7 +313,7 @@ func TestEngineRuntimeHaltsOnStoreFailure(t *testing.T) {
 	}
 }
 
-func TestStartEngineReplaysJournalAndReconcilesMatchLogs(t *testing.T) {
+func TestStartEngineReplaysJournalAndReconcilesPersistence(t *testing.T) {
 	journalStore := &memoryJournal{}
 	commands := []journal.Command{
 		{
@@ -276,9 +331,10 @@ func TestStartEngineReplaysJournalAndReconcilesMatchLogs(t *testing.T) {
 		}
 	}
 	matchStore := newIdempotentStore()
+	orderEventStore := newMemoryOrderEventStore()
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, newMemoryMarketStore("BTC-USD"))
+		runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, newMemoryMarketStore("BTC-USD"), orderEventStore)
 		if err != nil {
 			t.Fatalf("startEngine replay attempt %d: %v", attempt, err)
 		}
@@ -295,12 +351,15 @@ func TestStartEngineReplaysJournalAndReconcilesMatchLogs(t *testing.T) {
 	if len(matchStore.logs) != 1 {
 		t.Fatalf("replaying the same journal twice must keep one match log, got %d", len(matchStore.logs))
 	}
+	if len(orderEventStore.events) != 3 {
+		t.Fatalf("replaying the same journal twice must keep three order events, got %d", len(orderEventStore.events))
+	}
 }
 
 func TestRestartRecoversJournaledCommandAfterMatchLogFailure(t *testing.T) {
 	journalStore := &memoryJournal{}
 	matchStore := newIdempotentStore()
-	runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, newMemoryMarketStore("BTC-USD"))
+	runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, newMemoryMarketStore("BTC-USD"), newMemoryOrderEventStore())
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
@@ -322,7 +381,7 @@ func TestRestartRecoversJournaledCommandAfterMatchLogFailure(t *testing.T) {
 	cancel()
 
 	matchStore.err = nil
-	recovered, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, newMemoryMarketStore("BTC-USD"))
+	recovered, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, newMemoryMarketStore("BTC-USD"), newMemoryOrderEventStore())
 	if err != nil {
 		t.Fatalf("restart replay returned error: %v", err)
 	}
@@ -336,8 +395,84 @@ func TestRestartRecoversJournaledCommandAfterMatchLogFailure(t *testing.T) {
 	}
 }
 
+func TestRestartRecoversJournaledCommandAfterOrderEventFailure(t *testing.T) {
+	journalStore := &memoryJournal{}
+	matchStore := newIdempotentStore()
+	orderEventStore := newMemoryOrderEventStore()
+	runtime, err := startEngine(
+		context.Background(),
+		config.Default(),
+		matchStore,
+		journalStore,
+		newMemoryMarketStore("BTC-USD"),
+		orderEventStore,
+	)
+	if err != nil {
+		t.Fatalf("startEngine returned error: %v", err)
+	}
+
+	orderEventStore.err = errors.New("order event store unavailable")
+	order := models.CreateOrderRequest{
+		CommandID: "maker-command",
+		Ticker:    "BTC-USD",
+		UserID:    "maker",
+		OrderType: models.Limit,
+		Position:  models.Ask,
+		Price:     100,
+		Amount:    1,
+		Nonce:     1,
+	}
+	if err := runtime.router.OrderRouter(engine.Event{Type: engine.NewOrder, Ticker: order.Ticker, NewOrder: &order}); !errors.Is(err, engine.ErrEngineHalted) {
+		t.Fatalf("failed order event persistence want ErrEngineHalted, got %v", err)
+	}
+	if len(journalStore.commands) != 1 {
+		t.Fatalf("failed order event persistence must keep one journal command, got %d", len(journalStore.commands))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if err := runtime.shutdown(ctx); err != nil {
+		cancel()
+		t.Fatalf("failed runtime shutdown: %v", err)
+	}
+	cancel()
+
+	orderEventStore.err = nil
+	recovered, err := startEngine(
+		context.Background(),
+		config.Default(),
+		matchStore,
+		journalStore,
+		newMemoryMarketStore("BTC-USD"),
+		orderEventStore,
+	)
+	if err != nil {
+		t.Fatalf("restart replay returned error: %v", err)
+	}
+	if len(orderEventStore.events) != 1 {
+		t.Fatalf("restart should recover one missing order event, got %d", len(orderEventStore.events))
+	}
+	for _, event := range orderEventStore.events {
+		if event.Type != orderevent.Resting || event.CommandID != order.CommandID {
+			t.Fatalf("unexpected recovered order event: %#v", event)
+		}
+	}
+	snapshot, err := recovered.router.OrderBookSnapshot("BTC-USD", 1)
+	if err != nil {
+		t.Fatalf("snapshot recovered orderbook: %v", err)
+	}
+	if len(snapshot.Asks) != 1 || snapshot.Asks[0].Amount != 1 {
+		t.Fatalf("unexpected recovered orderbook: %#v", snapshot)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := recovered.shutdown(ctx); err != nil {
+		t.Fatalf("recovered runtime shutdown: %v", err)
+	}
+}
+
 func TestEngineRuntimeDoesNotApplyDuplicateCommandTwice(t *testing.T) {
-	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), &memoryJournal{}, newMemoryMarketStore("BTC-USD"))
+	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), &memoryJournal{}, newMemoryMarketStore("BTC-USD"), newMemoryOrderEventStore())
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
@@ -368,7 +503,7 @@ func TestEngineRuntimeAddsTickerAndRoutesCommands(t *testing.T) {
 	matchStore := newIdempotentStore()
 	journalStore := &memoryJournal{}
 	marketStore := newMemoryMarketStore("BTC-USD")
-	runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, marketStore)
+	runtime, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, marketStore, newMemoryOrderEventStore())
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}
@@ -404,7 +539,7 @@ func TestEngineRuntimeAddsTickerAndRoutesCommands(t *testing.T) {
 		t.Fatalf("runtime shutdown: %v", err)
 	}
 
-	recovered, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, marketStore)
+	recovered, err := startEngine(context.Background(), config.Default(), matchStore, journalStore, marketStore, newMemoryOrderEventStore())
 	if err != nil {
 		t.Fatalf("restart after ticker registration returned error: %v", err)
 	}
@@ -440,7 +575,7 @@ func TestStartEngineRestoresJournaledTickers(t *testing.T) {
 		}
 	}
 
-	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), journalStore, newMemoryMarketStore("BTC-USD"))
+	runtime, err := startEngine(context.Background(), config.Default(), newIdempotentStore(), journalStore, newMemoryMarketStore("BTC-USD"), newMemoryOrderEventStore())
 	if err != nil {
 		t.Fatalf("startEngine returned error: %v", err)
 	}

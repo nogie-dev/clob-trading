@@ -32,6 +32,15 @@ type OrderBookLevel struct {
 	CumulativeAmount float64 `json:"cumulativeAmount"`
 }
 
+// EditOrderResult captures the immutable state immediately before and after a
+// successful amendment. RequiresRematch is true when the amended order was
+// detached from the book because its price changed.
+type EditOrderResult struct {
+	Before          models.BookOrder
+	After           models.BookOrder
+	RequiresRematch bool
+}
+
 func NewOrderBook(ticker string) *OrderBook {
 	ob := &OrderBook{
 		Ticker: ticker,
@@ -111,26 +120,28 @@ func (ob *OrderBook) level(order *models.BookOrder) (*util.PriceLevel, map[float
 	return lvl, levels, h, true
 }
 
-func (ob *OrderBook) RemoveOrder(orderID string) {
+func (ob *OrderBook) RemoveOrder(orderID string) *models.BookOrder {
 	elem, ok := ob.Index[orderID]
 	if !ok || elem == nil {
 		slog.Warn("order not found in index", "orderID", orderID)
-		return
+		return nil
 	}
 
 	current, ok := elem.Value.(*models.BookOrder)
 	if !ok || current == nil {
 		slog.Error("order type mismatch", "orderID", orderID)
-		return
+		return nil
 	}
 
 	lvl, levels, h, ok := ob.level(current)
 	if !ok {
-		return
+		return nil
 	}
 
+	removed := *current
 	ob.removeElement(lvl, levels, h, elem, current.Amount)
 	logOrderCancelled(current)
+	return &removed
 }
 
 func (ob *OrderBook) removeElement(lvl *util.PriceLevel, levels map[float64]*util.PriceLevel, h heap.Interface, elem *list.Element, fallbackAmount float64) {
@@ -161,11 +172,11 @@ func (ob *OrderBook) removeElement(lvl *util.PriceLevel, levels map[float64]*uti
 	}
 }
 
-func (ob *OrderBook) EditOrder(req models.EditOrderRequest) *models.BookOrder {
+func (ob *OrderBook) EditOrder(req models.EditOrderRequest) *EditOrderResult {
 	return ob.EditOrderAt(req, time.Now())
 }
 
-func (ob *OrderBook) EditOrderAt(req models.EditOrderRequest, recordedAt time.Time) *models.BookOrder {
+func (ob *OrderBook) EditOrderAt(req models.EditOrderRequest, recordedAt time.Time) *EditOrderResult {
 	elem, ok := ob.Index[req.OrderID]
 	if !ok || elem == nil {
 		slog.Warn("order not found", "orderID", req.OrderID)
@@ -185,6 +196,10 @@ func (ob *OrderBook) EditOrderAt(req models.EditOrderRequest, recordedAt time.Ti
 
 	priceChanged := existing.Price != req.Price
 	amountChanged := req.Amount != nil && *req.Amount != existing.Amount
+	if !priceChanged && !amountChanged {
+		return nil
+	}
+	before := *existing
 
 	if priceChanged {
 		// 기존 레벨에서 제거, 업데이트된 주문 반환 (매칭은 bookworker에서)
@@ -195,28 +210,30 @@ func (ob *OrderBook) EditOrderAt(req models.EditOrderRequest, recordedAt time.Ti
 		}
 		existing.Timestamp = recordedAt
 		logOrderEdited(existing, "price_changed")
-		return existing
-	}
-
-	if amountChanged {
-		delta := *req.Amount - existing.Amount
-		if delta > 0 {
-			// 수량 증가: 우선순위 리셋을 위해 제거 후 재삽입
-			ob.removeElement(lvl, levels, h, elem, existing.Amount)
-			existing.Amount = *req.Amount
-			existing.Timestamp = recordedAt
-			ob.AddOrder(existing)
-			logOrderEdited(existing, "amount_increased")
-		} else {
-			// 수량 감소: 위치 유지, 누적만 반영
-			existing.Amount = *req.Amount
-			existing.Timestamp = recordedAt
-			lvl.TotalAmount += delta
-			logOrderEdited(existing, "amount_decreased")
+		return &EditOrderResult{
+			Before:          before,
+			After:           *existing,
+			RequiresRematch: true,
 		}
 	}
 
-	return nil
+	delta := *req.Amount - existing.Amount
+	if delta > 0 {
+		// 수량 증가: 우선순위 리셋을 위해 제거 후 재삽입
+		ob.removeElement(lvl, levels, h, elem, existing.Amount)
+		existing.Amount = *req.Amount
+		existing.Timestamp = recordedAt
+		ob.AddOrder(existing)
+		logOrderEdited(existing, "amount_increased")
+	} else {
+		// 수량 감소: 위치 유지, 누적만 반영
+		existing.Amount = *req.Amount
+		existing.Timestamp = recordedAt
+		lvl.TotalAmount += delta
+		logOrderEdited(existing, "amount_decreased")
+	}
+
+	return &EditOrderResult{Before: before, After: *existing}
 }
 
 func (ob *OrderBook) Snapshot(depth int) OrderBookSnapshot {
